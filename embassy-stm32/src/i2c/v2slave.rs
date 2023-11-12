@@ -1,11 +1,11 @@
 use core::result::Result;
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::{Channel, Receiver};
-use stm32_metapac::i2c;
+use embassy_sync::channel::Receiver;
 
 use super::{AddressIndex, I2c, Instance};
 use crate::i2c::{Dir, Error};
+use crate::pac::i2c;
 
 pub type I2cBuffer = [u8; SLAVE_BUFFER_SIZE];
 pub const SLAVE_BUFFER_SIZE: usize = 64;
