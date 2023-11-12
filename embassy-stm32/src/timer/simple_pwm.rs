@@ -126,7 +126,7 @@ impl<'d, T: CaptureCompare16bitInstance> SimplePwm<'d, T> {
     }
 
     pub fn reset(&mut self) {
-        self.inner.reset();
+        self.inner.reset()
     }
 
     pub fn get_max_duty(&self) -> u16 {
