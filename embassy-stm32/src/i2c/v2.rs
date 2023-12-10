@@ -108,6 +108,7 @@ impl Default for Config {
 pub struct State {
     pub(crate) waker: AtomicWaker,
     pub(crate) channel_out: Channel<CriticalSectionRawMutex, SlaveTransaction, SLAVE_QUEUE_DEPTH>,
+    pub(crate) channel_in: Channel<CriticalSectionRawMutex, SlaveTransaction, SLAVE_QUEUE_DEPTH>,
     pub(crate) mutex: Mutex<CriticalSectionRawMutex, RefCell<SlaveState>>,
 }
 
@@ -116,6 +117,7 @@ impl State {
         Self {
             waker: AtomicWaker::new(),
             channel_out: Channel::new(),
+            channel_in: Channel::new(),
             mutex: Mutex::new(RefCell::new(SlaveState::new())),
         }
     }

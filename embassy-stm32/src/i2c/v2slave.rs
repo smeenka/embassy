@@ -1,12 +1,11 @@
 use core::result::Result;
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::Receiver;
+use embassy_sync::channel::{Channel, Receiver};
 
 use super::{AddressIndex, I2c, Instance};
 use crate::i2c::{Dir, Error};
 use crate::pac::i2c;
-
 pub type I2cBuffer = [u8; SLAVE_BUFFER_SIZE];
 pub const SLAVE_BUFFER_SIZE: usize = 64;
 pub const SLAVE_QUEUE_DEPTH: usize = 5;
@@ -165,7 +164,12 @@ impl SlaveState {
     }
     // start the transaction. Select the current transaction index based on address and dir
     // Return the size of the current transaction
-    fn start_transaction(&mut self, address: u8, dir: Dir) -> u16 {
+    fn start_transaction(
+        &mut self,
+        address: u8,
+        dir: Dir,
+        channel_in: &Channel<CriticalSectionRawMutex, SlaveTransaction, SLAVE_QUEUE_DEPTH>,
+    ) -> u16 {
         let address16 = address as u16;
         let mut address_index = AddressIndex::Address1;
         self.transaction_index = if address16 == self.address1 {
@@ -192,12 +196,20 @@ impl SlaveState {
                     _ = transaction.insert(t);
                 }
                 Dir::READ => {
-                    // this is a real error. Master wants to read but there is no transaction
-                    // Create a dummy transaction here to contain the error
-                    let buf = [0xff; 1];
-                    let mut t = SlaveTransaction::new_read(&buf, address_index);
-                    t.result = Some(Error::NoTransaction);
-                    _ = transaction.insert(t);
+                    if address16 == self.address1 {
+                        if let Ok(t) = channel_in.try_receive() {
+                            _ = transaction.insert(t);
+                        }
+                    }
+                    // if there was no transaction in the in queue, the transaction is still none
+                    if transaction.is_none() {
+                        // this is a real error. Master wants to read but there is no transaction
+                        // Create a dummy transaction here to contain the error
+                        let buf = [0xff; 1];
+                        let mut t = SlaveTransaction::new_read(&buf, address_index);
+                        t.result = Some(Error::NoTransaction);
+                        _ = transaction.insert(t);
+                    }
                 }
             }
         }
@@ -322,6 +334,14 @@ impl<'d, T: Instance, TXDMA, RXDMA> I2c<'d, T, TXDMA, RXDMA> {
             Ok(())
         })
     }
+    pub fn slave_try_send_to_master_queue(&self, buffer: &[u8]) -> Result<(), Error> {
+        let transaction = SlaveTransaction::new_read(buffer, AddressIndex::Address1);
+        match T::state().channel_in.try_send(transaction) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(Error::Overrun),
+        }
+    }
+
     pub fn slave_prepare_write(&self) -> Result<(), Error> {
         T::state().mutex.lock(|f| {
             let mut state_m = f.borrow_mut();
@@ -350,6 +370,7 @@ impl<'d, T: Instance, TXDMA, RXDMA> I2c<'d, T, TXDMA, RXDMA> {
     ) -> Receiver<'static, CriticalSectionRawMutex, SlaveTransaction, SLAVE_QUEUE_DEPTH> {
         T::state().channel_out.receiver()
     }
+
     pub(crate) fn slave_interupt_handler(state_m: &mut SlaveState, regs: &i2c::I2c) {
         // ============================================ slave interrupt state_m machine
         let isr = regs.isr().read();
@@ -416,7 +437,7 @@ impl<'d, T: Instance, TXDMA, RXDMA> I2c<'d, T, TXDMA, RXDMA> {
             // handle the slave is addressed case, first step in the transaction
             let taddress = isr.addcode();
             let tdir = if isr.dir() as u8 == 0 { Dir::WRITE } else { Dir::READ };
-            let tsize = state_m.start_transaction(taddress, tdir);
+            let tsize = state_m.start_transaction(taddress, tdir, &T::state().channel_in);
 
             if tdir == Dir::READ {
                 // flush i2c tx register
