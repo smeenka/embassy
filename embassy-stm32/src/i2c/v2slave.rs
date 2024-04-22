@@ -326,10 +326,10 @@ impl<'d, T: Instance, TXDMA, RXDMA> I2c<'d, T, TXDMA, RXDMA> {
         T::state().mutex.lock(|f| {
             let mut state_m = f.borrow_mut();
             state_m.prepare_write();
-            if state_m.transactions[address as usize + 1].is_some() {
-                state_m.error_count += 1;
-                return Err(Error::Overrun);
-            }
+            // if state_m.transactions[address as usize + 1].is_some() {
+            //    state_m.error_count += 1;
+            //    return Err(Error::Overrun);
+            // }
             _ = state_m.transactions[address as usize + 1].insert(SlaveTransaction::new_read(buffer, address));
             Ok(())
         })
