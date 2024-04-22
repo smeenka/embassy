@@ -464,9 +464,9 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
             return Err(Error::AddressOutOfRange(addr));
         }
 
-        if i2c_reserved_addr(addr) {
-            return Err(Error::AddressReserved(addr));
-        }
+        //if i2c_reserved_addr(addr) {
+        //    return Err(Error::AddressReserved(addr));
+        //}
 
         let p = T::regs();
         p.ic_enable().write(|w| w.set_enable(false));
