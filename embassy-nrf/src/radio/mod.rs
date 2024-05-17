@@ -5,6 +5,9 @@
 
 #![macro_use]
 
+/// todo remove
+ use log;
+
 /// Bluetooth Low Energy Radio driver.
 pub mod ble;
 #[cfg(any(
@@ -17,12 +20,19 @@ pub mod ble;
 /// IEEE 802.15.4
 pub mod ieee802154;
 
-use core::marker::PhantomData;
+#[cfg(feature = "nrf-esb")]
+pub mod esb;
 
-use embassy_sync::waitqueue::AtomicWaker;
+use core::{cell::RefCell, marker::PhantomData};
+
+use embassy_sync::{
+    blocking_mutex::{raw::CriticalSectionRawMutex, Mutex},
+    waitqueue::AtomicWaker,
+};
 use pac::radio::state::STATE_A as RadioState;
 pub use pac::radio::txpower::TXPOWER_A as TxPower;
 
+use self::esb::esb_state::EsbState;
 use crate::{interrupt, pac, Peripheral};
 
 /// RADIO error.
@@ -40,6 +50,12 @@ pub enum Error {
     ChannelInUse,
     /// CRC check failed
     CrcFailed(u16),
+    #[cfg(feature = "nrf-esb")]
+    ChannelFull,
+    #[cfg(feature = "nrf-esb")]
+    ChannelEmpty,
+    #[cfg(feature = "nrf-esb")]
+    PipeNrTooHigh,
 }
 
 /// Interrupt handler
@@ -53,6 +69,8 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
         let s = T::state();
         // clear all interrupts
         r.intenclr.write(|w| w.bits(0xffff_ffff));
+        log::info!("Ixx");
+
         s.event_waker.wake();
     }
 }
@@ -60,11 +78,16 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
 pub(crate) struct State {
     /// end packet transmission or reception
     event_waker: AtomicWaker,
+    #[cfg(feature = "nrf-esb")]
+    pub(crate) mutex: Mutex<CriticalSectionRawMutex, RefCell<EsbState>>,
 }
 impl State {
     pub(crate) const fn new() -> Self {
         Self {
             event_waker: AtomicWaker::new(),
+            #[cfg(feature = "nrf-esb")]
+            // inner mutability pattern
+            mutex: Mutex::new(RefCell::new(EsbState::new())),
         }
     }
 }
