@@ -1,5 +1,6 @@
 pub use esb_config::EsbConfig;
 pub use esb_radio::EsbRadio;
+pub use esb_radio::EsbRadioRx;
 
 /// Configuration of the Enhanced Shockburst Radio.
 pub mod esb_config;
@@ -38,22 +39,23 @@ pub enum ECrcSize {
     Size2,
 }
 
-/// The ERadioState is the state shared between the driver and the interrupt. It lives in the interrupt state
+/// The ERadioState is the state only in the embassy driver context. It is not shared with the interrupt
 #[derive(PartialEq, Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ERadioState {
-    /// PTX and PRX role: The radio is inactive
-    Inactive,
-    /// PTX and PRX role: the radio is requested to start a receing transaction.
-    StartReceiving,
-    /// PTX and PRX role: The radio is listening for incoming packets.
-    Receiving,
-    /// PTX and PRX role: the radio is requested to start a transmit transacktion.
-    StartTransmitting,
-    /// PTX and PRX role: the radio is busy transmitting packets, until the tx channel is emtpy. 
-    Transmitting,
-    /// PRX role. The radio is busy transmitting the ack packet
-    TransmittingAck,
-    /// PTX role: The radio did send a packet and is now listening for the incoming ack of the remote
-    TransmitterWaitAck,
-
+    /// The radio is inactive
+    Idle,
+    /// The radio is listening for incoming packets.
+    Receiving(u32), // parameter is the dma buffer pointer for the tx buffer for sending the ack response,
+    /// Packet is received and the ack is send
+    ReceiveTransmitAck,
+    ReceiveFinished, // irq will be disarmed
+    /// the radio should send the packet, and does nnot need to wait for an ack
+    TransmitNoAck,
+    TransmitNoAckFinished,
+    /// The radio should send a packet and be prepared to receive the ack response
+    TransmitAck,
+    // packet is transmitted, and now waiting for ack received
+    TransmitAckWait,
+    TransmitAckFinished,
 }

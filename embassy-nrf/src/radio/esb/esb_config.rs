@@ -25,15 +25,15 @@ impl Default for EsbConfig {
     fn default() -> Self {
         EsbConfig {
             data_rate: EDataRate::Dr1Mbps,
-            crc_size: ECrcSize::Size2,
-            tx_power: TxPower::_0D_BM,
+            crc_size: ECrcSize::Size1,
+            tx_power: TxPower::NEG8D_BM,
             base0: [b't', b'x', b'c', b'h'], // "txch" for tx channel
             base1: [b'p', b'i', b'p', b'e'], // "pipe"
             prefixes0: [0, 1, 2, 3],
             prefixes1: [4, 5, 6, 7],
             rf_channel: 90,
             max_retries: 15, // [0, 15]
-            retry_delay: 4,  // 1 ms between retries
+            retry_delay: 40, // 10 ms between retries
         }
     }
 }

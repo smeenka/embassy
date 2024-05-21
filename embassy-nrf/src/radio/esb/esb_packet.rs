@@ -2,7 +2,9 @@ use super::MAX_PACKET_SIZE;
 
 const DMA_PACKET_SIZE: usize = MAX_PACKET_SIZE + 2;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+
 pub struct EsbPacket {
     rssi: Option<u8>,
     pipe_nr: u8,
@@ -46,12 +48,23 @@ impl EsbPacket {
             data,
         }
     }
+    /// In driver context (not interrupt!), create a packet for receiving.
+    pub fn rx_packet(pipe_nr: u8) -> Self {
+        EsbPacket {
+            rssi: None,
+            pipe_nr,
+            data: [0; DMA_PACKET_SIZE],
+        }
+    }
     pub(crate) fn dma_pointer(&self) -> u32 {
-        self.data.as_ptr() as *const u8 as u32
+        (self.data.as_ptr() as *const u8) as u32
     }
     /// get the lenght of the data in the packet. Only valid if the packet contains valid data
     pub fn len(&self) -> u8 {
         self.data[0]
+    }
+    pub fn data(&self) -> &[u8] {
+        &self.data
     }
     /// get the ack bit from the data in the packet. Only valid after the packet contains valid data
     pub fn pid(&self) -> u8 {

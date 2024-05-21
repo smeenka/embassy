@@ -5,9 +5,6 @@
 
 #![macro_use]
 
-/// todo remove
- use log;
-
 /// Bluetooth Low Energy Radio driver.
 pub mod ble;
 #[cfg(any(
@@ -32,11 +29,11 @@ use embassy_sync::{
 use pac::radio::state::STATE_A as RadioState;
 pub use pac::radio::txpower::TXPOWER_A as TxPower;
 
-use self::esb::esb_state::EsbState;
+use self::esb::{esb_packet::EsbPacket, esb_state::EsbState, ERadioState};
 use crate::{interrupt, pac, Peripheral};
 
 /// RADIO error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Error {
@@ -51,11 +48,16 @@ pub enum Error {
     /// CRC check failed
     CrcFailed(u16),
     #[cfg(feature = "nrf-esb")]
+    /// Even after retry the transmit of a packet was unsuccesfull. The packet is returned in the error
+    NoAckResponse(Option<EsbPacket>),
+    #[cfg(feature = "nrf-esb")]
     ChannelFull,
     #[cfg(feature = "nrf-esb")]
     ChannelEmpty,
     #[cfg(feature = "nrf-esb")]
     PipeNrTooHigh,
+    #[cfg(feature = "nrf-esb")]
+    IncorrectRadioState(ERadioState),
 }
 
 /// Interrupt handler
@@ -68,9 +70,11 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
         let r = T::regs();
         let s = T::state();
         // clear all interrupts
+        #[cfg(not(feature = "nrf-esb"))]
         r.intenclr.write(|w| w.bits(0xffff_ffff));
-        log::info!("Ixx");
-
+        #[cfg(feature = "nrf-esb")]
+        self::esb::esb_radio::on_interrupt(r, s);
+        #[cfg(not(feature = "nrf-esb"))]
         s.event_waker.wake();
     }
 }
