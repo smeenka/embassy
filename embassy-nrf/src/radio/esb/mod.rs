@@ -1,6 +1,8 @@
 pub use esb_config::EsbConfig;
 pub use esb_radio::EsbRadio;
+pub use esb_radio::EsbRadioAck;
 pub use esb_radio::EsbRadioRx;
+pub use esb_radio::EsbRadioTx;
 
 /// Configuration of the Enhanced Shockburst Radio.
 pub mod esb_config;
@@ -20,6 +22,7 @@ pub enum EDataRate {
     Dr2Mbps,
 }
 pub const CHANNEL_RX_SIZE: usize = 10;
+pub const CHANNEL_TX_SIZE: usize = 10;
 pub const CHANNEL_ACK_SIZE: usize = 10;
 pub const MAX_PACKET_SIZE: usize = 32;
 pub const MAX_NR_PIPES: usize = 5;
@@ -50,6 +53,7 @@ pub enum ERadioState {
     /// Packet is received and the ack is send
     ReceiveTransmitAck,
     ReceiveFinished, // irq will be disarmed
+    TransmitCheck,   // Check if there is a packet to send
     /// the radio should send the packet, and does nnot need to wait for an ack
     TransmitNoAck,
     TransmitNoAckFinished,

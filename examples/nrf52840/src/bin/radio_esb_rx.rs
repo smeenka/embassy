@@ -13,7 +13,7 @@ use embassy_nrf::radio;
 use embassy_usb::Config;
 use embassy_futures::join::join;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
-use embassy_nrf::radio::esb::{EsbConfig, EsbRadio, EsbRadioRx, EsbRadioTx};
+use embassy_nrf::radio::esb::{EsbConfig, EsbRadio, EsbRadioRx};
 use embassy_usb::Builder;
 use embassy_nrf::usb::Driver;
 use embassy_nrf::pac;
@@ -26,17 +26,21 @@ bind_interrupts!(struct Irqs {
     RADIO => radio::InterruptHandler<peripherals::RADIO>;
 });
 
+
 #[embassy_executor::task]
-async fn alive_task() {
-  Timer::after_secs(3).await;
+async fn alive_task(mut led: Output<'static>) {
   log::info!("Starting alive task");
     loop {
+        led.set_low();
         log::info!("Hello World from Nrf Radio ESB test");
+        Timer::after_millis(100).await;
+        led.set_high();
         Timer::after_secs(10).await;
     }
 }
+
 #[embassy_executor::task]
-async fn radio_tx_task(mut led: Output<'static> ) {
+async fn radio_rx_task(mut led: Output<'static> , mut esb_radio: EsbRadio<'static, peripherals::RADIO>) {
     for _i in 0..10 {
       led.set_low();
       Timer::after_millis(100).await;
@@ -48,52 +52,36 @@ async fn radio_tx_task(mut led: Output<'static> ) {
     let mut counter = 0_u8;
     loop {
         led.set_low();
-        log::info!("App: Sending # {}", counter);
+        log::info!("App: Sending Hello World from Nrf Radio ESB test to remote {}", counter);
         let bytes = "Hello World Radio ESB ".as_bytes();
         counter =if counter > 250 { 32} else {counter + 1};
         let packet = EsbPacket::tx_packet(&bytes, 1, true);
-        EsbRadioTx::tx_send(packet).await; 
+        if let Err(e) = esb_radio.send_packet(packet).await {
+          log::info!("Error while sending packet: {:?}",e);
+        }
         Timer::after_millis(100).await;
         led.set_high();
-        Timer::after_millis(2000).await;
+        Timer::after_millis(550).await;
     }
 }
 
-#[embassy_executor::task]
-async fn radio_rx_task(mut led: Output<'static>) {
-    Timer::after_secs(3).await;
-    log::info!("Waiting for incoming packets");
+async fn error_task(mut led: Output<'static>) {
     loop {
-        let packet = EsbRadioRx::rx_receive().await;
         led.set_low();
-        log::info!("Received packet:{:?}", packet);
         Timer::after_millis(50).await;
         led.set_high();
+        Timer::after_millis(200).await;
     }
 }
-#[embassy_executor::task]
-async fn radio_driver_task(mut radio: EsbRadio<'static, peripherals::RADIO>, mut led: Output<'static>) {
-    Timer::after_secs(5).await;
-    log::info!("Starting the radio statemachine task inside the esb radio driver");
-    loop {
-        match radio.statemachine_runonce().await {
-          Ok(_) => (),
-          Err(e) => {
-            log::info!("Error did happen: {:?}", e);
-            led.set_low();
-            Timer::after_millis(100);
-            led.set_high();
-          }
-        }
-    }
-}
+
+
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_nrf::init(Default::default());
-    let led_blue = Output::new(p.P0_12.degrade(), Level::High, OutputDrive::Standard);
-    let led_green = Output::new(p.P1_09.degrade(), Level::High, OutputDrive::Standard);
-    let led_red = Output::new(p.P0_08.degrade(), Level::High, OutputDrive::Standard);
+    let mut led_blue = Output::new(p.P0_12.degrade(), Level::High, OutputDrive::Standard);
+    let mut led_green = Output::new(p.P1_09.degrade(), Level::High, OutputDrive::Standard);
+    let mut led_red = Output::new(p.P0_08.degrade(), Level::High, OutputDrive::Standard);
     let clock: pac::CLOCK = unsafe { mem::transmute(()) };
 
     log::info!("Enabling ext hfosc...");
@@ -106,7 +94,7 @@ async fn main(spawner: Spawner) {
     // Create embassy-usb Config
     let mut config = Config::new(0xc0de, 0xcafe);
     config.manufacturer = Some("Embassy");
-    config.product = Some("NRF_Radio_ESB_TX_example");
+    config.product = Some("NRF_Radio_ESB_RX_example");
     config.serial_number = Some("12345678");
     config.max_power = 100;
     config.max_packet_size_0 = 64;
@@ -152,14 +140,13 @@ async fn main(spawner: Spawner) {
     let config = EsbConfig::default();
     if let Err(e) =esb_radio.init(&config) {
       log::info!("Initialization error of esb radio: {:?}",e);
+      // error_task(led_red).await
     }
 
-    _ = spawner.spawn(radio_tx_task(led_blue)); 
-    _ = spawner.spawn(alive_task());
-    _ = spawner.spawn(radio_rx_task(led_green));
-    _ = spawner.spawn(radio_driver_task(esb_radio, led_red));
-
+    _ = spawner.spawn(radio_rx_task(led_green, esb_radio)); 
+    _ = spawner.spawn(alive_task(led_blue));
     // Run everything concurrently.
+    // If we had made everything `'static` above instead, we could do this using separate tasks instead.
     join(usb_fut, log_fut).await;
 }
 

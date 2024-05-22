@@ -1,18 +1,21 @@
 use core::future::poll_fn;
 use core::sync::atomic::{compiler_fence, Ordering};
 use core::task::Poll;
+use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer};
 
 use super::esb_config::EsbConfig;
 use super::esb_packet::EsbPacket;
 use super::esb_state::PipeState;
-use super::{ECrcSize, EDataRate, ERadioState, CHANNEL_RX_SIZE, MAX_NR_PIPES, MAX_PACKET_SIZE};
+use super::{
+    ECrcSize, EDataRate, ERadioState, CHANNEL_ACK_SIZE, CHANNEL_RX_SIZE, CHANNEL_TX_SIZE, MAX_NR_PIPES, MAX_PACKET_SIZE,
+};
 use crate::interrupt;
 use crate::interrupt::typelevel::Interrupt;
 use crate::pac::radio::RegisterBlock;
 use crate::radio::State;
 use crate::radio::{Error, Instance, InterruptHandler};
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select, select3, Either, Either3};
 use embassy_hal_internal::{into_ref, Peripheral, PeripheralRef};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use log;
@@ -31,6 +34,15 @@ const CRC_INIT1: u32 = 0x0000_00FF;
 const CRC_POLY1: u32 = 0x0000_0107;
 
 static CHANNEL_RX: Channel<CriticalSectionRawMutex, EsbPacket, CHANNEL_RX_SIZE> = Channel::new();
+static CHANNEL_TX: Channel<CriticalSectionRawMutex, EsbPacket, CHANNEL_TX_SIZE> = Channel::new();
+static SIGNAL_TX: Signal<CriticalSectionRawMutex, usize> = Signal::new();
+static PIPES: [Channel<CriticalSectionRawMutex, EsbPacket, CHANNEL_ACK_SIZE>; MAX_NR_PIPES] = [
+    Channel::new(),
+    Channel::new(),
+    Channel::new(),
+    Channel::new(),
+    Channel::new(),
+];
 
 #[derive()]
 // MaxNrPipes is the maximum number of pipes to use. Note that each configured pipe will use 10 x MaxPacketSize of memory
@@ -152,70 +164,32 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
         log::info!("init finished");
         Ok(())
     }
-    // add packet for sending. In case packet cannot be added it will be returned in the Err
-    // In case the radio is idle the packet will be send immediatly
-    // In case the radio is busy, it will send the packet lateron
-    pub async fn send_packet(&mut self, mut packet: EsbPacket) -> Result<(), Error> {
-        let pid = self.pipes[packet.pipe_nr() as usize].inc_tx_pid();
-        packet.set_pid(pid);
-        self.current_tx_packet = Some(packet);
-        match self.transmit() {
-            Ok(state) => self.set_radio_state(state),
-            Err(e) => {
-                log::info!("Error: {:?}", e);
-                return Err(e);
-            }
-        }
-        self.retry_counter = 0;
-
-        self.statemachine_task().await?;
-        if self.current_tx_packet.is_some() {
-            log::info!("Error: Packet should be consumed now!")
-        }
-        // drop current packet
-        self.current_tx_packet.take();
-        Ok(())
-    }
-
-    pub fn try_add_ack_packet(&mut self, packet: EsbPacket) -> Result<(), Error> {
-        let pipe_nr = packet.pipe_nr() as usize;
-        match self.pipes[pipe_nr].channel_ack().try_send(packet) {
-            Ok(_) => {
-                self.pipes[pipe_nr].preload_ack();
-                Ok(())
-            }
-            Err(_) => Err(Error::ChannelFull),
-        }
-    }
-    pub async fn add_ack_packet(&mut self, packet: EsbPacket) {
-        let pipe_nr = packet.pipe_nr() as usize;
-        self.pipes[pipe_nr].channel_ack().send(packet).await;
-        self.pipes[pipe_nr].preload_ack()
-    }
 
     /// This state machine is awoken by the interrupt, and runs as an embassy task (NOT in interrupt context)
     ///
-    async fn statemachine_task(&mut self) -> Result<(), Error> {
-        loop {
-            let timeout = self.timer_timeout;
-            let new_radio_state = match select(self.statemachine_poll(), Timer::at(timeout)).await {
-                Either::First(new_radio_state) => new_radio_state,
-                Either::Second(_) => self.timeout_handler(),
-            };
-            match new_radio_state {
-                Ok(state) => {
-                    self.set_radio_state(state);
-                    if let ERadioState::Idle = state {
-                        return Ok(());
-                    }
-                }
-                Err(e) => {
-                    self.set_radio_state(ERadioState::Idle);
-                    return Err(e);
-                }
+    /// this task should be run by the top level application in a loop.
+    /// The top level applicaion is the owner of the radio
+    /// On each iteration an error can be returnned
+    pub async fn statemachine_runonce(&mut self) -> Result<(), Error> {
+        let timeout = self.timer_timeout;
+        Timer::after_millis(0).await; // needed to make the funtion decent async. Select alone will hang
+        let new_radio_state = match select3(self.statemachine_poll(), Timer::at(timeout), SIGNAL_TX.wait()).await {
+            Either3::First(new_radio_state) => new_radio_state,
+            Either3::Second(_) => self.timeout_handler(),
+            Either3::Third(_) => self.try_send_packet(),
+        };
+        match new_radio_state {
+            Ok(state) => {
+                self.set_radio_state(state);
+                Ok(())
+            }
+            Err(e) => {
+                self.set_radio_state(ERadioState::Idle);
+                Err(e)
             }
         }
     }
+
     async fn statemachine_poll(&mut self) -> Result<ERadioState, Error> {
         // After each interrupt this code will runonce due to the waker in the interrupt
         let state = T::state();
@@ -239,6 +213,10 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
         let regs = T::regs();
         // log::info!("State: {:?} ", radio_state);
         match radio_state {
+            ERadioState::TransmitCheck => {
+                let new_state = self.check_tx_can_send();
+                Poll::Ready(new_state)
+            }
             // PTX and PRX role: the radio is busy transmitting packets, until the tx channel is emtpy.
             ERadioState::TransmitAckFinished => {
                 if regs.crcstatus.read().crcstatus().is_crcok() {
@@ -261,7 +239,6 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
                 log::info!("Transmit done no ack");
                 Poll::Ready(Ok(ERadioState::Idle))
             }
-            ERadioState::Idle => Poll::Ready(Ok(ERadioState::Idle)),
             _ => Poll::Pending,
         }
     }
@@ -297,6 +274,46 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
             _ => (),
         }
         Ok(radio_state)
+    }
+
+    /// If the radio is idle, and there is a packet to send, send this packet.
+    /// Else do nothing, the radio state machine should pick up this tx packet when idle
+    /// Errors are added to CHANNEL_RX queue
+    pub fn try_send_packet(&mut self) -> Result<ERadioState, Error> {
+        let mut state = ERadioState::Idle;
+        // lock the mutex as short as possible
+        T::state().mutex.lock(|f| {
+            let state_m = f.borrow();
+            state = state_m.radio_state;
+        });
+        if let ERadioState::Idle = state {
+            self.check_tx_can_send()
+        } else {
+            // no change to current state
+            Ok(ERadioState::Idle)
+        }
+    }
+
+    /// Check the CHANNEL_TX. If emtpy return to idle state
+    /// Check the current_packet. If None, take one from the CHANNEL_TX
+    /// Assumed is that the radio is idle, and can send the packet
+    /// Return the new radio state in the result
+    pub fn check_tx_can_send(&mut self) -> Result<ERadioState, Error> {
+        if self.current_tx_packet.is_none() {
+            if CHANNEL_TX.is_empty() {
+                return Ok(ERadioState::Idle);
+            } else {
+                if let Ok(mut p) = CHANNEL_TX.try_receive() {
+                    log::info!("Start sending packet with pid:{:?}", p.pid());
+                    let pipe_nr = p.pipe_nr() as usize;
+                    let pid = self.pipes[pipe_nr].inc_tx_pid();
+                    p.set_pid(pid);
+                    self.current_tx_packet = Some(p);
+                }
+            }
+        }
+        self.retry_counter = 0;
+        self.transmit()
     }
 
     /// Transmit a packet. Setup interrupts and events
@@ -415,6 +432,51 @@ impl EsbRadioRx {
         match CHANNEL_RX.try_receive() {
             Ok(packet) => Ok(packet),
             Err(_) => Err(Error::ChannelEmpty),
+        }
+    }
+}
+pub struct EsbRadioTx {}
+
+impl EsbRadioTx {
+    // static functions
+    pub async fn tx_send(packet: EsbPacket) {
+        CHANNEL_TX.send(packet).await;
+        SIGNAL_TX.signal(0) // actual value does not matter
+    }
+    pub fn tx_try_send(packet: EsbPacket) -> Result<(), Error> {
+        match CHANNEL_TX.try_send(packet) {
+            Ok(_) => {
+                SIGNAL_TX.signal(0); // acutal value does not matter
+                Ok(())
+            }
+            Err(_) => Err(Error::ChannelFull),
+        }
+    }
+}
+pub struct EsbRadioAck {}
+
+impl EsbRadioAck {
+    // static functions
+    pub async fn ack_send(packet: EsbPacket) -> Result<(), Error> {
+        let pipe_nr = packet.pipe_nr() as usize;
+        if pipe_nr < MAX_NR_PIPES {
+            PIPES[pipe_nr].send(packet).await;
+            Ok(())
+        } else {
+            log::info!("Incorrect pipe");
+            Err(Error::PipeNrTooHigh)
+        }
+    }
+    pub fn ack_try_send(packet: EsbPacket) -> Result<(), Error> {
+        let pipe_nr = packet.pipe_nr() as usize;
+        if pipe_nr < MAX_NR_PIPES {
+            match PIPES[pipe_nr].try_send(packet) {
+                Ok(_) => Ok(()),
+                Err(_) => Err(Error::ChannelFull),
+            }
+        } else {
+            log::info!("Incorrect pipe");
+            Err(Error::PipeNrTooHigh)
         }
     }
 }
