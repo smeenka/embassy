@@ -57,6 +57,8 @@ pub enum Error {
     #[cfg(feature = "nrf-esb")]
     PipeNrTooHigh,
     #[cfg(feature = "nrf-esb")]
+    ReuseChannelEmpty,
+    #[cfg(feature = "nrf-esb")]
     IncorrectRadioState(ERadioState),
 }
 

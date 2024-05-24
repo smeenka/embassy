@@ -5,6 +5,7 @@ use super::{esb_packet::EsbPacket, ERadioState};
 pub(crate) struct EsbState {
     pub(crate) radio_state: ERadioState,
     pub(crate) timestamp: Instant,
+    pub(crate) current_rx_packet: Option<EsbPacket>,
 }
 
 impl EsbState {
@@ -12,6 +13,7 @@ impl EsbState {
         EsbState {
             radio_state: ERadioState::Idle,
             timestamp: Instant::MIN,
+            current_rx_packet: None,
         }
     }
 }
@@ -36,6 +38,18 @@ impl PipeState {
 
     pub(crate) fn pipe_nr(&self) -> u8 {
         self.pipe_nr
+    }
+    pub fn set_rx_pid(&mut self, pid: u8) {
+        self.last_rx_pid = pid
+    }
+    pub fn rx_pid(&mut self) -> u8 {
+        self.last_rx_pid
+    }
+    pub fn set_checksum(&mut self, cs: u16) {
+        self.last_checksum = cs
+    }
+    pub fn checksum(&mut self) -> u16 {
+        self.last_checksum
     }
 
     pub fn inc_tx_pid(&mut self) -> u8 {

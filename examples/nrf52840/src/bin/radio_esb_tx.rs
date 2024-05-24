@@ -13,12 +13,14 @@ use embassy_nrf::radio;
 use embassy_usb::Config;
 use embassy_futures::join::join;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
-use embassy_nrf::radio::esb::{EsbConfig, EsbRadio, EsbRadioRx, EsbRadioTx};
+use embassy_nrf::radio::esb::{EsbConfig, EsbRadio, EsbRadioRx, EsbRadioTx, EsbRadioAck};
 use embassy_usb::Builder;
 use embassy_nrf::usb::Driver;
 use embassy_nrf::pac;
 use embassy_executor::Spawner;
 use embassy_nrf::radio::esb::esb_packet::EsbPacket;
+use crate::radio::esb::ECrcSize;
+
 
 bind_interrupts!(struct Irqs {
     USBD => usb::InterruptHandler<peripherals::USBD>;
@@ -52,7 +54,7 @@ async fn radio_tx_task(mut led: Output<'static> ) {
         let bytes = "Hello World Radio ESB ".as_bytes();
         counter =if counter > 250 { 32} else {counter + 1};
         let packet = EsbPacket::tx_packet(&bytes, 1, true);
-        EsbRadioTx::tx_send(packet).await; 
+        EsbRadioTx::send(packet).await; 
         Timer::after_millis(100).await;
         led.set_high();
         Timer::after_millis(2000).await;
@@ -61,14 +63,33 @@ async fn radio_tx_task(mut led: Output<'static> ) {
 
 #[embassy_executor::task]
 async fn radio_rx_task(mut led: Output<'static>) {
+    let mut counter = 0_u8;
     Timer::after_secs(3).await;
+    // fill the reuse channel with enough empty packets
+    for _i in 0..5 {
+      EsbRadioRx::rx_packet(EsbPacket::empty());
+    }
+    for i in 0..5 {
+      let mut data = [b'c'; 10];
+      data[0] = b'a' + i;
+      EsbRadioAck::send(EsbPacket::tx_packet(&data, 2, true)).await;
+    }
+
     log::info!("Waiting for incoming packets");
     loop {
-        let packet = EsbRadioRx::rx_receive().await;
+        let packet = EsbRadioRx::receive().await;
         led.set_low();
         log::info!("Received packet:{:?}", packet);
+        EsbRadioRx::rx_packet(packet);
         Timer::after_millis(50).await;
         led.set_high();
+        counter += 1;
+        if counter == 128 {
+          counter = 32;
+        }
+        let mut data = [b'c'; 10];
+        data[0] = counter;
+        _ = EsbRadioAck::try_send(EsbPacket::tx_packet(&data, 2, true));
     }
 }
 #[embassy_executor::task]
@@ -149,12 +170,13 @@ async fn main(spawner: Spawner) {
     let usb_fut = usb.run();
     
     let mut esb_radio: EsbRadio<'static, peripherals::RADIO> = EsbRadio::new(p.RADIO, Irqs);
-    let config = EsbConfig::default();
+    let mut config = EsbConfig::default();
+    config.set_crc_size(ECrcSize::Size2);
     if let Err(e) =esb_radio.init(&config) {
       log::info!("Initialization error of esb radio: {:?}",e);
     }
 
-    _ = spawner.spawn(radio_tx_task(led_blue)); 
+    //_ = spawner.spawn(radio_tx_task(led_blue)); 
     _ = spawner.spawn(alive_task());
     _ = spawner.spawn(radio_rx_task(led_green));
     _ = spawner.spawn(radio_driver_task(esb_radio, led_red));

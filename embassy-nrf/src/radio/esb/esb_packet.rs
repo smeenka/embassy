@@ -16,11 +16,12 @@ pub struct EsbPacket {
 }
 
 impl EsbPacket {
-    pub fn empty(pipe_nr: u8) -> Self {
+    pub fn empty() -> Self {
+        let data = [0; DMA_PACKET_SIZE];
         EsbPacket {
             rssi: None,
-            pipe_nr,
-            data: [0; DMA_PACKET_SIZE],
+            pipe_nr: 0,
+            data,
         }
     }
     /// In user context, create an ack  packet for sending in an ack response. Pid will be added to the packet in the driver
@@ -32,7 +33,7 @@ impl EsbPacket {
     pub fn tx_packet(tx_data: &[u8], pipe_nr: u8, ack: bool) -> Self {
         let no_ack = if ack { 0 } else { 1 };
         let mut data = [0; DMA_PACKET_SIZE];
-        let len = if tx_data.len() > MAX_PACKET_SIZE {
+        let len = if tx_data.len() >= MAX_PACKET_SIZE {
             MAX_PACKET_SIZE
         } else {
             tx_data.len()
@@ -50,14 +51,23 @@ impl EsbPacket {
     }
     /// In driver context (not interrupt!), create a packet for receiving.
     pub fn rx_packet(pipe_nr: u8) -> Self {
+        let data = [0; DMA_PACKET_SIZE];
         EsbPacket {
             rssi: None,
             pipe_nr,
-            data: [0; DMA_PACKET_SIZE],
+            data,
         }
     }
     pub(crate) fn dma_pointer(&self) -> u32 {
         (self.data.as_ptr() as *const u8) as u32
+    }
+
+    pub fn reset(&mut self) {
+        self.rssi = None;
+        self.pipe_nr = 0;
+        for i in 0..DMA_PACKET_SIZE {
+            self.data[i] = 0;
+        }
     }
     /// get the lenght of the data in the packet. Only valid if the packet contains valid data
     pub fn len(&self) -> u8 {
@@ -83,6 +93,9 @@ impl EsbPacket {
     }
     pub fn pipe_nr(&self) -> u8 {
         self.pipe_nr
+    }
+    pub fn set_pipe_nr(&mut self, pipe_nr: u8) {
+        self.pipe_nr = pipe_nr
     }
     pub fn set_rssi(&mut self, rssi: u8) {
         self.rssi = Some(rssi)
