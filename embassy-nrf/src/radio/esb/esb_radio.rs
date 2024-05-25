@@ -16,7 +16,7 @@ use crate::interrupt::typelevel::Interrupt;
 use crate::pac::radio::RegisterBlock;
 use crate::radio::State;
 use crate::radio::{Error, Instance, InterruptHandler};
-use embassy_futures::select::{select, select3, Either, Either3};
+use embassy_futures::select::{select3, Either3};
 use embassy_hal_internal::{into_ref, Peripheral, PeripheralRef};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use log;
@@ -58,6 +58,9 @@ pub struct EsbRadio<'d, T: Instance> {
     max_retries: u8,    //
     retry_delay: usize, // with 250 us resolution
     retry_counter: u8,
+    last_tx_pid: u8,
+    last_rx_pid: u8,
+    last_checksum: u16,
 }
 
 impl<'d, T: Instance> EsbRadio<'d, T> {
@@ -78,11 +81,34 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
             ],
             current_tx_packet: None,
             timer_timeout: Instant::MAX,
+            last_rx_pid: 0,
+            last_tx_pid: 0,
+            last_checksum: 0,
             max_retries: 15, //
             retry_delay: 4,  // with 250 us resolution
             retry_counter: 0,
         }
     }
+    pub fn set_rx_pid(&mut self, pid: u8) {
+        self.last_rx_pid = pid
+    }
+    pub fn rx_pid(&mut self) -> u8 {
+        self.last_rx_pid
+    }
+    pub fn inc_tx_pid(&mut self) -> u8 {
+        self.last_tx_pid = (self.last_tx_pid + 1) & 0x3;
+        self.last_tx_pid
+    }
+    pub fn tx_pid(&self) -> u8 {
+        self.last_tx_pid
+    }
+    pub fn set_checksum(&mut self, cs: u16) {
+        self.last_checksum = cs
+    }
+    pub fn checksum(&mut self) -> u16 {
+        self.last_checksum
+    }
+
     /// Configure the device
     /// set all its properties for proper operation and power it up.
     /// The device does remain in standby until self.listen() or self.send() is called.
@@ -234,26 +260,32 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
                 if let Some(mut p) = rx_packet {
                     let crc = regs.rxcrc.read().rxcrc().bits() as u16;
                     if regs.crcstatus.read().crcstatus().is_crcerror() {
-                        EsbRadioRx::rx_packet(p);
-                        return Poll::Ready(Err(Error::CrcFailed(crc)));
+                        // treat crc as if nothing did happen.
+                        EsbRadioRx::reuse_rx_packet(p);
+                        return Poll::Ready(Ok(ERadioState::ReceivePrepare));
                     }
                     let pipe_nr = regs.rxmatch.read().rxmatch().bits() as usize;
                     if pipe_nr >= MAX_NR_PIPES {
-                        EsbRadioRx::rx_packet(p);
+                        EsbRadioRx::reuse_rx_packet(p);
                         return Poll::Ready(Err(Error::PipeNrTooHigh));
                     }
-                    let pipe = &mut self.pipes[pipe_nr];
                     let pid = p.pid();
-                    if pid == pipe.rx_pid() && crc == pipe.checksum() {
-                        log::info!("Repeated packet. Not adding to queue");
-                        EsbRadioRx::rx_packet(p)
+                    if pid == self.rx_pid() && crc == self.checksum() {
+                        // log::info!("Repeated packet. Not adding to queue");
+                        self.pipes[pipe_nr].inc_last_rx_retry();
+                        EsbRadioRx::reuse_rx_packet(p);
                     } else {
                         // update pipe admin
-                        self.pipes[pipe_nr].set_rx_pid(p.pid());
-                        self.pipes[pipe_nr].set_checksum(crc);
+                        self.set_rx_pid(pid);
+                        self.set_checksum(crc);
                         // update packet
+                        if p.ack() {
+                            // a packet was send. The tx pid was incremented in interrupt state, but not yet updated here
+                            _ = self.inc_tx_pid();
+                        }
                         p.set_rssi(regs.rssisample.read().rssisample().bits());
                         p.set_pipe_nr(pipe_nr as u8);
+                        p.set_retry(self.pipes[pipe_nr].last_rx_retry());
                         // send to application
                         if let Err(_) = CHANNEL_RX.try_send(p) {
                             return Poll::Ready(Err(Error::ChannelFull));
@@ -357,8 +389,7 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
             } else {
                 if let Ok(mut p) = CHANNEL_TX.try_receive() {
                     log::info!("Start sending packet with pid:{:?}", p.pid());
-                    let pipe_nr = p.pipe_nr() as usize;
-                    let pid = self.pipes[pipe_nr].inc_tx_pid();
+                    let pid = self.inc_tx_pid();
                     p.set_pid(pid);
                     self.current_tx_packet = Some(p);
                 }
@@ -406,10 +437,12 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
     fn transmit(&mut self) -> Result<ERadioState, Error> {
         let regs = T::regs();
         let mut new_radio_state = ERadioState::Idle;
+        let tx_pid = self.inc_tx_pid();
 
-        if let Some(tx_packet) = &self.current_tx_packet {
+        if let Some(tx_packet) = &mut self.current_tx_packet {
             // Note the reference is crucial for the DMA to work!
             let pipe_nr = tx_packet.pipe_nr();
+            tx_packet.set_pid(tx_pid);
 
             if tx_packet.ack() {
                 // Go to RX mode after the transmission
@@ -466,9 +499,6 @@ pub(crate) fn on_interrupt(regs: &RegisterBlock, state: &State) {
         match state_m.radio_state {
             ERadioState::Idle => (),
             ERadioState::Receiving => {
-                // remove the shortcut rx->disabled to tx enable for sending the ack
-                regs.shorts.modify(|_, w| w.disabled_txen().disabled());
-
                 if regs.crcstatus.read().crcstatus().is_crcerror() {
                     // treat error as if no packet was received. Let the driver code decide what to do
                     log::info!("Checksum error");
@@ -477,37 +507,45 @@ pub(crate) fn on_interrupt(regs: &RegisterBlock, state: &State) {
                         // disable IRQ the rest handled in driver context
                         regs.intenclr.write(|w| w.bits(0xFFFF_FFFF));
                     }
+                    regs.shorts.modify(|_, w| w.disabled_txen().disabled());
                     compiler_fence(Ordering::Release);
                     state.event_waker.wake();
                     return;
                 }
                 if let Some(p) = state_m.current_rx_packet {
-                    // At this point we cannot inspect the received packet as it is not in the interrupt state
-                    // A design decision was to place the pipe state in the driver state, not interrupt state
-                    // This is a limitation of the current code.
-                    // So we cannot check if the remote does or does not want an ACK. Assume for now it is ACK
-
                     // check if the remote node does want to receive an ACK
                     if p.ack() {
                         let pipe_nr = regs.rxmatch.read().rxmatch().bits() as usize;
-                        let mut _ack_packet = None;
-                        if pipe_nr < MAX_NR_PIPES {
-                            match PIPES[pipe_nr].try_receive() {
-                                Ok(p) => _ack_packet = Some(p),
-                                Err(_) => _ack_packet = Some(EsbPacket::empty()),
-                            }
+                        let crc = regs.rxcrc.read().rxcrc().bits() as u16;
+                        let pid = p.pid();
+                        if pid == state_m.last_rx_pid && crc == state_m.last_rx_checksum {
+                            // log::info!("Repeated packet. do nothing here");
                         } else {
-                            // fallback code, will never (??) execute
-                            _ack_packet = Some(EsbPacket::empty());
+                            // remember state previous packet
+                            state_m.last_rx_pid = pid;
+                            state_m.last_rx_checksum = crc;
+                            // drop previous packet
+                            state_m.current_ack_packet.take();
+                        }
+                        if state_m.current_ack_packet.is_none() {
+                            if pipe_nr < MAX_NR_PIPES {
+                                match PIPES[pipe_nr].try_receive() {
+                                    Ok(p) => state_m.current_ack_packet = Some(p),
+                                    Err(_) => state_m.current_ack_packet = Some(EsbPacket::empty()),
+                                }
+                            } else {
+                                // fallback code, will never (??) execute
+                                state_m.current_ack_packet = Some(EsbPacket::empty());
+                            }
                         }
                         // Note the reference is crucial for the DMA to work!
-                        if let Some(ack) = &mut _ack_packet {
-                            // ack packet should have the same pid as the incoming packet
-                            ack.set_pid(p.pid());
+                        compiler_fence(Ordering::Release);
+                        if let Some(ack) = &mut state_m.current_ack_packet {
                             // Note that the next step is very time critical, it must be done before the radio turnaround
                             // from RX to TX is finished (130 us). So it can only be done in interrupt context
                             unsafe {
                                 regs.packetptr.write(|w| w.bits(ack.dma_pointer()));
+                                regs.txaddress.write(|w| w.txaddress().bits(pipe_nr as u8));
                             }
                         }
                         state_m.radio_state = ERadioState::ReceiveTransmitAck;
@@ -515,6 +553,8 @@ pub(crate) fn on_interrupt(regs: &RegisterBlock, state: &State) {
                         state_m.radio_state = ERadioState::ReceiveFinished
                     }
                 }
+                // remove the shortcut rx->disabled to tx enable for sending the ack
+                regs.shorts.modify(|_, w| w.disabled_txen().disabled());
             }
             ERadioState::ReceiveTransmitAck => {
                 unsafe {
@@ -548,7 +588,6 @@ pub(crate) fn on_interrupt(regs: &RegisterBlock, state: &State) {
             }
             _ => (),
         }
-        // log::info!("-I-");
     }); // end of mutex
 }
 
@@ -567,7 +606,7 @@ impl EsbRadioRx {
     }
     // the reuse channel does contain the packets to be used for receiving
     // After receive the packet should be returned to this queue
-    pub fn rx_packet(mut packet: EsbPacket) {
+    pub fn reuse_rx_packet(mut packet: EsbPacket) {
         packet.reset();
         _ = CHANNEL_REUSE.try_send(packet); // discard error channel full
     }

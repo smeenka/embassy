@@ -29,7 +29,7 @@ use embassy_sync::{
 use pac::radio::state::STATE_A as RadioState;
 pub use pac::radio::txpower::TXPOWER_A as TxPower;
 
-use self::esb::{esb_packet::EsbPacket, esb_state::EsbState, ERadioState};
+use self::esb::{esb_packet::EsbPacket, esb_state::EsbIrqState, ERadioState};
 use crate::{interrupt, pac, Peripheral};
 
 /// RADIO error.
@@ -85,7 +85,7 @@ pub(crate) struct State {
     /// end packet transmission or reception
     event_waker: AtomicWaker,
     #[cfg(feature = "nrf-esb")]
-    pub(crate) mutex: Mutex<CriticalSectionRawMutex, RefCell<EsbState>>,
+    pub(crate) mutex: Mutex<CriticalSectionRawMutex, RefCell<EsbIrqState>>,
 }
 impl State {
     pub(crate) const fn new() -> Self {
@@ -93,7 +93,7 @@ impl State {
             event_waker: AtomicWaker::new(),
             #[cfg(feature = "nrf-esb")]
             // inner mutability pattern
-            mutex: Mutex::new(RefCell::new(EsbState::new())),
+            mutex: Mutex::new(RefCell::new(EsbIrqState::new())),
         }
     }
 }

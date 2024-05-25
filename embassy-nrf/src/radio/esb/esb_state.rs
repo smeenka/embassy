@@ -2,61 +2,44 @@ use embassy_time::Instant;
 
 use super::{esb_packet::EsbPacket, ERadioState};
 
-pub(crate) struct EsbState {
+pub(crate) struct EsbIrqState {
     pub(crate) radio_state: ERadioState,
     pub(crate) timestamp: Instant,
     pub(crate) current_rx_packet: Option<EsbPacket>,
+    pub(crate) current_ack_packet: Option<EsbPacket>,
+    pub(crate) last_rx_pid: u8,
+    pub(crate) last_rx_checksum: u16,
 }
 
-impl EsbState {
+impl EsbIrqState {
     pub(crate) const fn new() -> Self {
-        EsbState {
+        EsbIrqState {
             radio_state: ERadioState::Idle,
             timestamp: Instant::MIN,
             current_rx_packet: None,
+            current_ack_packet: None,
+            last_rx_pid: 0,
+            last_rx_checksum: 0,
         }
     }
 }
-
+#[derive(Clone, Copy)]
 pub(crate) struct PipeState {
-    last_checksum: u16,
-    last_tx_pid: u8,
-    last_rx_pid: u8,
-    pipe_nr: u8,
-    ack_packet: Option<EsbPacket>,
+    last_rx_retry: u8,
 }
 impl PipeState {
     pub(crate) const fn new(pipe_nr: u8) -> Self {
-        Self {
-            pipe_nr,
-            last_checksum: 0,
-            last_rx_pid: 0,
-            last_tx_pid: 0,
-            ack_packet: None,
+        Self { last_rx_retry: 0 }
+    }
+    // return last_rx_retry and reset
+    pub fn last_rx_retry(&mut self) -> u8 {
+        let result = self.last_rx_retry;
+        self.last_rx_retry = 0;
+        result
+    }
+    pub fn inc_last_rx_retry(&mut self) {
+        if self.last_rx_retry < 255 {
+            self.last_rx_retry += 1
         }
-    }
-
-    pub(crate) fn pipe_nr(&self) -> u8 {
-        self.pipe_nr
-    }
-    pub fn set_rx_pid(&mut self, pid: u8) {
-        self.last_rx_pid = pid
-    }
-    pub fn rx_pid(&mut self) -> u8 {
-        self.last_rx_pid
-    }
-    pub fn set_checksum(&mut self, cs: u16) {
-        self.last_checksum = cs
-    }
-    pub fn checksum(&mut self) -> u16 {
-        self.last_checksum
-    }
-
-    pub fn inc_tx_pid(&mut self) -> u8 {
-        self.last_tx_pid = (self.last_tx_pid + 1) & 0x3;
-        self.last_tx_pid
-    }
-    pub fn ack_packet(&self) -> &Option<EsbPacket> {
-        &self.ack_packet
     }
 }

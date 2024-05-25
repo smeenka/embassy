@@ -67,7 +67,7 @@ async fn radio_rx_task(mut led: Output<'static>) {
     Timer::after_secs(3).await;
     // fill the reuse channel with enough empty packets
     for _i in 0..5 {
-      EsbRadioRx::rx_packet(EsbPacket::empty());
+      EsbRadioRx::reuse_rx_packet(EsbPacket::empty());
     }
     for i in 0..5 {
       let mut data = [b'c'; 10];
@@ -80,7 +80,7 @@ async fn radio_rx_task(mut led: Output<'static>) {
         let packet = EsbRadioRx::receive().await;
         led.set_low();
         log::info!("Received packet:{:?}", packet);
-        EsbRadioRx::rx_packet(packet);
+        EsbRadioRx::reuse_rx_packet(packet);
         Timer::after_millis(50).await;
         led.set_high();
         counter += 1;

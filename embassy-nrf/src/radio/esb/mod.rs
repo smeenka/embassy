@@ -53,7 +53,7 @@ pub enum ERadioState {
     /// The radio is listening for incoming packets.
     Receiving,
     /// A packet was received and Ack is transmitting now
-    ReceiveTransmitAck, 
+    ReceiveTransmitAck,
     /// Packet is received and the ack is send
     ReceiveFinished,
     TransmitCheck, // Check if there is a packet to send

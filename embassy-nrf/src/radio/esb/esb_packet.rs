@@ -8,6 +8,10 @@ const DMA_PACKET_SIZE: usize = MAX_PACKET_SIZE + 2;
 pub struct EsbPacket {
     rssi: Option<u8>,
     pipe_nr: u8,
+    // for a rx packet this is the amount of resends of the previous packet, not the current, per pipe
+    // for a tx packet this is the amount of resends of the current packet. only usefull if the packet is returned to the app
+    // in case it cannot be send
+    retry: u8,
     /// Note this is the Dma buffer which will be send or received via EasyDma.
     /// The buffer is 2 bytes longer than the MaxPacketSize
     /// Byte 0 contains the size of the data
@@ -17,10 +21,12 @@ pub struct EsbPacket {
 
 impl EsbPacket {
     pub fn empty() -> Self {
-        let data = [0; DMA_PACKET_SIZE];
+        let mut data = [0; DMA_PACKET_SIZE];
+        data[1] = 1; // mark no_ack as default
         EsbPacket {
             rssi: None,
             pipe_nr: 0,
+            retry: 0,
             data,
         }
     }
@@ -46,16 +52,19 @@ impl EsbPacket {
         EsbPacket {
             rssi: None,
             pipe_nr,
+            retry: 0,
             data,
         }
     }
     /// In driver context (not interrupt!), create a packet for receiving.
     pub fn rx_packet(pipe_nr: u8) -> Self {
-        let data = [0; DMA_PACKET_SIZE];
+        let mut data = [0; DMA_PACKET_SIZE];
+        data[1] = 1; // mark no_ack as default
         EsbPacket {
             rssi: None,
             pipe_nr,
             data,
+            retry: 0,
         }
     }
     pub(crate) fn dma_pointer(&self) -> u32 {
@@ -65,6 +74,7 @@ impl EsbPacket {
     pub fn reset(&mut self) {
         self.rssi = None;
         self.pipe_nr = 0;
+        self.retry = 0;
         for i in 0..DMA_PACKET_SIZE {
             self.data[i] = 0;
         }
@@ -88,6 +98,19 @@ impl EsbPacket {
             true
         }
     }
+    pub fn retry(&self) -> u8 {
+        self.retry
+    }
+
+    pub fn inc_retry(&mut self) {
+        if self.retry < 255 {
+            self.retry += 1
+        }
+    }
+    pub fn set_retry(&mut self, retry: u8) {
+        self.retry = retry
+    }
+
     pub fn rssi(&self) -> Option<u8> {
         self.rssi
     }
