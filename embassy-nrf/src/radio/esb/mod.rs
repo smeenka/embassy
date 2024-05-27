@@ -1,8 +1,11 @@
 pub use esb_config::EsbConfig;
 pub use esb_radio::EsbRadio;
 pub use esb_radio::EsbRadioAck;
-pub use esb_radio::EsbRadioRx;
-pub use esb_radio::EsbRadioTx;
+pub use esb_radio::EsbRadioCommand;
+pub use esb_radio::EsbRadioEvent;
+
+use self::esb_packet::EsbPacket;
+use self::esb_state::AckReporting;
 
 /// Configuration of the Enhanced Shockburst Radio.
 pub mod esb_config;
@@ -21,7 +24,7 @@ pub enum EDataRate {
     /// 2 megabit per second
     Dr2Mbps,
 }
-pub const CHANNEL_RX_SIZE: usize = 10;
+pub const CHANNEL_RX_SIZE: usize = 20;
 pub const CHANNEL_TX_SIZE: usize = 10;
 pub const CHANNEL_ACK_SIZE: usize = 10;
 pub const MAX_PACKET_SIZE: usize = 32;
@@ -65,4 +68,30 @@ pub enum ERadioState {
     // packet is transmitted, and now waiting for ack received
     TransmitAckWait,
     TransmitAckFinished,
+}
+
+/// The ERadioCommand is via a channel send from the application to the radio driver
+#[derive(PartialEq, Debug, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum ERadioCommand {
+    /// Send data to the remote node
+    Data(EsbPacket),
+    /// Ack reporting on/off. Default off.
+    /// Reporting on will generate for each consumed Ack packet an reporting event, with the timestamp and the counter value
+    /// Reporting makes it easy to maintain the connection state with the remote node with timestamp field
+    /// And ack queue management with the counter value
+    AckReporting(bool),
+    // More commands for changing parameters in the driver can be added here ...
+}
+/// The ERadioEvent is sent from the driver to the application via a channel
+#[derive(PartialEq, Debug, Clone)]
+pub enum ERadioEvent {
+    /// Data as received from a remote node, send to application
+    Data(EsbPacket),
+    /// Ack reporting on/off. Default off.
+    /// Reporting on will generate for each consumed Ack packet an reporting event, with the timestamp and the counter value
+    /// Reporting makes it easy to maintain the connection state with the remote node with timestamp field
+    /// And ack queue management with the counter value
+    AckReporting(AckReporting),
+    // More events can be added here ...
 }

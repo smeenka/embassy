@@ -17,6 +17,9 @@ pub struct EsbPacket {
     /// Byte 0 contains the size of the data
     /// Byte 1 contains the 3 metabits for Esb: bit 0-1 packet counter, bit 2: NoAck
     data: [u8; DMA_PACKET_SIZE],
+    /// counter can be used for fifo management of the ack channels
+    /// The application is reponsible for incrementing the counter
+    counter: usize
 }
 
 impl EsbPacket {
@@ -28,15 +31,19 @@ impl EsbPacket {
             pipe_nr: 0,
             retry: 0,
             data,
+            counter: 0
         }
     }
     /// In user context, create an ack  packet for sending in an ack response. Pid will be added to the packet in the driver
-    pub fn ack_packet(tx_data: &[u8], pipe_nr: u8) -> Self {
-        EsbPacket::tx_packet(tx_data, pipe_nr, false)
+    pub fn ack_packet(tx_data: &[u8], pipe_nr: u8, counter: usize) -> Self {
+        let mut packet = EsbPacket::tx_packet(tx_data, pipe_nr, false);
+        packet.counter = counter;
+        packet
+
     }
 
     /// In user context, create a packet for sending. Pid will be added to the packet in the driver
-    pub fn tx_packet(tx_data: &[u8], pipe_nr: u8, ack: bool) -> Self {
+    pub fn tx_packet(tx_data: &[u8], pipe_nr: u8, ack: bool ) -> Self {
         let no_ack = if ack { 0 } else { 1 };
         let mut data = [0; DMA_PACKET_SIZE];
         let len = if tx_data.len() >= MAX_PACKET_SIZE {
@@ -54,6 +61,7 @@ impl EsbPacket {
             pipe_nr,
             retry: 0,
             data,
+            counter: 0
         }
     }
     /// In driver context (not interrupt!), create a packet for receiving.
@@ -65,6 +73,7 @@ impl EsbPacket {
             pipe_nr,
             data,
             retry: 0,
+            counter: 0
         }
     }
     pub(crate) fn dma_pointer(&self) -> u32 {
@@ -97,6 +106,9 @@ impl EsbPacket {
         } else {
             true
         }
+    }
+    pub fn counter(&self) -> usize {
+      self.counter
     }
     pub fn retry(&self) -> u8 {
         self.retry

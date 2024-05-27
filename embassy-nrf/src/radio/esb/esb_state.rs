@@ -9,6 +9,8 @@ pub(crate) struct EsbIrqState {
     pub(crate) current_ack_packet: Option<EsbPacket>,
     pub(crate) last_rx_pid: u8,
     pub(crate) last_rx_checksum: u16,
+    pub(crate) ack_reporting: bool,
+
 }
 
 impl EsbIrqState {
@@ -20,6 +22,8 @@ impl EsbIrqState {
             current_ack_packet: None,
             last_rx_pid: 0,
             last_rx_checksum: 0,
+            ack_reporting: false,
+
         }
     }
 }
@@ -41,5 +45,26 @@ impl PipeState {
         if self.last_rx_retry < 255 {
             self.last_rx_retry += 1
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AckReporting {
+    timestamp: Instant,
+    counter: usize,
+}
+
+impl AckReporting {
+    pub fn new(counter: usize) -> Self {
+        AckReporting {
+            timestamp: Instant::now(),
+            counter,
+        }
+    }
+    pub fn timestamp(&self) -> Instant {
+        self.timestamp
+    }
+    pub fn counter(&self) -> usize {
+        self.counter
     }
 }

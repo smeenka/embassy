@@ -6,10 +6,10 @@ use embassy_time::{Duration, Instant, Timer};
 
 use super::esb_config::EsbConfig;
 use super::esb_packet::EsbPacket;
-use super::esb_state::PipeState;
+use super::esb_state::{AckReporting, PipeState};
 use super::{
-    ECrcSize, EDataRate, ERadioState, CHANNEL_ACK_SIZE, CHANNEL_RX_SIZE, CHANNEL_TX_SIZE, MAX_NR_PIPES,
-    MAX_PACKET_SIZE, RECEIVE_MASK,
+    ECrcSize, EDataRate, ERadioCommand, ERadioEvent, ERadioState, CHANNEL_ACK_SIZE, CHANNEL_RX_SIZE, CHANNEL_TX_SIZE,
+    MAX_NR_PIPES, MAX_PACKET_SIZE, RECEIVE_MASK,
 };
 use crate::interrupt;
 use crate::interrupt::typelevel::Interrupt;
@@ -34,8 +34,8 @@ const CRC_POLY2: u32 = 0x0001_1021;
 const CRC_INIT1: u32 = 0x0000_00FF;
 const CRC_POLY1: u32 = 0x0000_0107;
 
-static CHANNEL_RX: Channel<CriticalSectionRawMutex, EsbPacket, CHANNEL_RX_SIZE> = Channel::new();
-static CHANNEL_TX: Channel<CriticalSectionRawMutex, EsbPacket, CHANNEL_TX_SIZE> = Channel::new();
+static CHANNEL_EVENTS: Channel<CriticalSectionRawMutex, ERadioEvent, CHANNEL_RX_SIZE> = Channel::new();
+static CHANNEL_COMMANDS: Channel<CriticalSectionRawMutex, ERadioCommand, CHANNEL_TX_SIZE> = Channel::new();
 static CHANNEL_REUSE: Channel<CriticalSectionRawMutex, EsbPacket, CHANNEL_TX_SIZE> = Channel::new();
 static SIGNAL_TX: Signal<CriticalSectionRawMutex, usize> = Signal::new();
 static PIPES: [Channel<CriticalSectionRawMutex, EsbPacket, CHANNEL_ACK_SIZE>; MAX_NR_PIPES] = [
@@ -259,21 +259,22 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
 
                 if let Some(mut p) = rx_packet {
                     let crc = regs.rxcrc.read().rxcrc().bits() as u16;
+                    let pipe_nr = regs.rxmatch.read().rxmatch().bits() as usize;
                     if regs.crcstatus.read().crcstatus().is_crcerror() {
-                        // treat crc as if nothing did happen.
-                        EsbRadioRx::reuse_rx_packet(p);
+                        // treat crc as if no packet was received. Increment retry count and go again!
+                        EsbRadioEvent::reuse_rx_packet(p);
+                        self.pipes[pipe_nr].inc_last_rx_retry();
                         return Poll::Ready(Ok(ERadioState::ReceivePrepare));
                     }
-                    let pipe_nr = regs.rxmatch.read().rxmatch().bits() as usize;
                     if pipe_nr >= MAX_NR_PIPES {
-                        EsbRadioRx::reuse_rx_packet(p);
+                        EsbRadioEvent::reuse_rx_packet(p);
                         return Poll::Ready(Err(Error::PipeNrTooHigh));
                     }
                     let pid = p.pid();
                     if pid == self.rx_pid() && crc == self.checksum() {
                         // log::info!("Repeated packet. Not adding to queue");
                         self.pipes[pipe_nr].inc_last_rx_retry();
-                        EsbRadioRx::reuse_rx_packet(p);
+                        EsbRadioEvent::reuse_rx_packet(p);
                     } else {
                         // update pipe admin
                         self.set_rx_pid(pid);
@@ -287,7 +288,7 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
                         p.set_pipe_nr(pipe_nr as u8);
                         p.set_retry(self.pipes[pipe_nr].last_rx_retry());
                         // send to application
-                        if let Err(_) = CHANNEL_RX.try_send(p) {
+                        if let Err(_) = CHANNEL_EVENTS.try_send(ERadioEvent::Data(p)) {
                             return Poll::Ready(Err(Error::ChannelFull));
                         }
                     }
@@ -297,17 +298,16 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
                 }
             }
             ERadioState::TransmitCheck => {
-                let new_state = self.check_tx_can_send();
+                let new_state = self.check_commands();
                 Poll::Ready(new_state)
             }
-            // PTX and PRX role: the radio is busy transmitting packets, until the tx channel is emtpy.
             ERadioState::TransmitAckFinished => {
                 if regs.crcstatus.read().crcstatus().is_crcok() {
                     // tx successfull, drop packet
                     if let Some(mut ack_data) = self.current_tx_packet.take() {
                         // the tx packet contains the ack message,as the dma pointer did not change
                         ack_data.set_rssi(regs.rssisample.read().rssisample().bits());
-                        if let Err(_) = CHANNEL_RX.try_send(ack_data) {
+                        if let Err(_) = CHANNEL_EVENTS.try_send(ERadioEvent::Data(ack_data)) {
                             return Poll::Ready(Err(Error::ChannelFull));
                         }
                     }
@@ -372,26 +372,35 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
             state = state_m.radio_state;
         });
         match state {
-            ERadioState::Idle => self.check_tx_can_send(),
-            ERadioState::Receiving => self.check_tx_can_send(),
+            ERadioState::Idle => self.check_commands(),
+            ERadioState::Receiving => self.check_commands(),
             _ => Ok(state), // do not change the state
         }
     }
 
-    /// Check the CHANNEL_TX. If emtpy return to idle state
+    /// Check the CHANNEL_COMMANDS. If emtpy check the receive state state
     /// Check the current_packet. If None, take one from the CHANNEL_TX
     /// Assumed is that the radio is idle, and can send the packet
     /// Return the new radio state in the result
-    pub fn check_tx_can_send(&mut self) -> Result<ERadioState, Error> {
+    pub fn check_commands(&mut self) -> Result<ERadioState, Error> {
         if self.current_tx_packet.is_none() {
-            if CHANNEL_TX.is_empty() {
+            if CHANNEL_COMMANDS.is_empty() {
                 return Ok(ERadioState::ReceivePrepare);
             } else {
-                if let Ok(mut p) = CHANNEL_TX.try_receive() {
-                    log::info!("Start sending packet with pid:{:?}", p.pid());
-                    let pid = self.inc_tx_pid();
-                    p.set_pid(pid);
-                    self.current_tx_packet = Some(p);
+                if let Ok(command) = CHANNEL_COMMANDS.try_receive() {
+                    match command {
+                        ERadioCommand::Data(mut p) => {
+                            let pid = self.inc_tx_pid();
+                            p.set_pid(pid);
+                            self.current_tx_packet = Some(p);
+                        }
+                        ERadioCommand::AckReporting(reporting) => {
+                          log::info!("Setting ack reporting to {}", reporting);
+                          T::state().mutex.lock(|f| {
+                            let mut state_m = f.borrow_mut();
+                            state_m.ack_reporting = reporting
+                        })},
+                    }
                 }
             }
         }
@@ -499,9 +508,10 @@ pub(crate) fn on_interrupt(regs: &RegisterBlock, state: &State) {
         match state_m.radio_state {
             ERadioState::Idle => (),
             ERadioState::Receiving => {
+                let mut previous_packet = None;
                 if regs.crcstatus.read().crcstatus().is_crcerror() {
                     // treat error as if no packet was received. Let the driver code decide what to do
-                    log::info!("Checksum error");
+                    // log::info!("Checksum error");
                     state_m.radio_state = ERadioState::ReceiveFinished;
                     unsafe {
                         // disable IRQ the rest handled in driver context
@@ -525,7 +535,7 @@ pub(crate) fn on_interrupt(regs: &RegisterBlock, state: &State) {
                             state_m.last_rx_pid = pid;
                             state_m.last_rx_checksum = crc;
                             // drop previous packet
-                            state_m.current_ack_packet.take();
+                            previous_packet = state_m.current_ack_packet.take();
                         }
                         if state_m.current_ack_packet.is_none() {
                             if pipe_nr < MAX_NR_PIPES {
@@ -538,14 +548,22 @@ pub(crate) fn on_interrupt(regs: &RegisterBlock, state: &State) {
                                 state_m.current_ack_packet = Some(EsbPacket::empty());
                             }
                         }
-                        // Note the reference is crucial for the DMA to work!
                         compiler_fence(Ordering::Release);
+                        // Note the reference is crucial for the DMA to work!
                         if let Some(ack) = &mut state_m.current_ack_packet {
                             // Note that the next step is very time critical, it must be done before the radio turnaround
                             // from RX to TX is finished (130 us). So it can only be done in interrupt context
                             unsafe {
                                 regs.packetptr.write(|w| w.bits(ack.dma_pointer()));
                                 regs.txaddress.write(|w| w.txaddress().bits(pipe_nr as u8));
+                            }
+                        }
+                        compiler_fence(Ordering::Release);
+                        // handle option ack reporting after the dma pointer is set, so a bit extra time in the interrupt does not hurt
+                        if state_m.ack_reporting {
+                            if let Some(p) = previous_packet {
+                                let report = AckReporting::new(p.counter());
+                                _ = CHANNEL_EVENTS.try_send(ERadioEvent::AckReporting(report));
                             }
                         }
                         state_m.radio_state = ERadioState::ReceiveTransmitAck;
@@ -591,16 +609,16 @@ pub(crate) fn on_interrupt(regs: &RegisterBlock, state: &State) {
     }); // end of mutex
 }
 
-pub struct EsbRadioRx {}
+pub struct EsbRadioEvent {}
 
-impl EsbRadioRx {
+impl EsbRadioEvent {
     // static functions
-    pub async fn receive() -> EsbPacket {
-        CHANNEL_RX.receive().await
+    pub async fn receive() -> ERadioEvent {
+        CHANNEL_EVENTS.receive().await
     }
-    pub fn try_receive() -> Result<EsbPacket, Error> {
-        match CHANNEL_RX.try_receive() {
-            Ok(packet) => Ok(packet),
+    pub fn try_receive() -> Result<ERadioEvent, Error> {
+        match CHANNEL_EVENTS.try_receive() {
+            Ok(event) => Ok(event),
             Err(_) => Err(Error::ChannelEmpty),
         }
     }
@@ -611,16 +629,16 @@ impl EsbRadioRx {
         _ = CHANNEL_REUSE.try_send(packet); // discard error channel full
     }
 }
-pub struct EsbRadioTx {}
+pub struct EsbRadioCommand {}
 
-impl EsbRadioTx {
+impl EsbRadioCommand {
     // static functions
-    pub async fn send(packet: EsbPacket) {
-        CHANNEL_TX.send(packet).await;
+    pub async fn send(command: ERadioCommand) {
+        CHANNEL_COMMANDS.send(command).await;
         SIGNAL_TX.signal(0) // actual value does not matter
     }
-    pub fn try_send(packet: EsbPacket) -> Result<(), Error> {
-        match CHANNEL_TX.try_send(packet) {
+    pub fn try_send(command: ERadioCommand) -> Result<(), Error> {
+        match CHANNEL_COMMANDS.try_send(command) {
             Ok(_) => {
                 SIGNAL_TX.signal(0); // acutal value does not matter
                 Ok(())

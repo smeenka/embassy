@@ -13,7 +13,7 @@ use embassy_nrf::radio;
 use embassy_usb::Config;
 use embassy_futures::join::join;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
-use embassy_nrf::radio::esb::{EsbConfig, EsbRadio, EsbRadioRx, EsbRadioTx, EsbRadioAck};
+use embassy_nrf::radio::esb::{EsbConfig, EsbRadio, EsbRadioCommand, EsbRadioEvent, ERadioEvent, ERadioCommand, EsbRadioAck};
 use embassy_usb::Builder;
 use embassy_nrf::usb::Driver;
 use embassy_nrf::pac;
@@ -38,7 +38,7 @@ async fn alive_task() {
     }
 }
 #[embassy_executor::task]
-async fn radio_tx_task(mut led: Output<'static> ) {
+async fn test_commands_task(mut led: Output<'static> ) {
     for _i in 0..10 {
       led.set_low();
       Timer::after_millis(100).await;
@@ -47,49 +47,60 @@ async fn radio_tx_task(mut led: Output<'static> ) {
     }
     log::info!("Test send packet with ack");
     Timer::after_millis(100).await;
-    let mut counter = 0_u8;
+    let mut counter = 0;
     loop {
         led.set_low();
         log::info!("App: Sending # {}", counter);
         let bytes = "Hello World Radio ESB ".as_bytes();
-        counter =if counter > 250 { 32} else {counter + 1};
         let packet = EsbPacket::tx_packet(&bytes, 1, true);
-        EsbRadioTx::send(packet).await; 
+        EsbRadioCommand::send(ERadioCommand::Data(packet)).await; 
         Timer::after_millis(100).await;
         led.set_high();
+        counter += 1;
         Timer::after_millis(2000).await;
     }
 }
 
 #[embassy_executor::task]
-async fn radio_rx_task(mut led: Output<'static>) {
-    let mut counter = 0_u8;
+async fn test_events_task(mut led: Output<'static>) {
+    let mut data0 = 0_u8;
+    let mut counter = 0;
     Timer::after_secs(3).await;
     // fill the reuse channel with enough empty packets
     for _i in 0..5 {
-      EsbRadioRx::reuse_rx_packet(EsbPacket::empty());
+      EsbRadioEvent::reuse_rx_packet(EsbPacket::empty());
     }
     for i in 0..5 {
       let mut data = [b'c'; 10];
       data[0] = b'a' + i;
-      EsbRadioAck::send(EsbPacket::tx_packet(&data, 2, true)).await;
+      EsbRadioAck::send(EsbPacket::ack_packet(&data, 2, counter)).await;
+      counter += 1;
     }
+    // EsbRadioCommand::send(ERadioCommand::AckReporting(true)).await; // not yet functional. hangs!!
 
-    log::info!("Waiting for incoming packets");
+    log::info!("Waiting for incoming events");
     loop {
-        let packet = EsbRadioRx::receive().await;
+        let event = EsbRadioEvent::receive().await;
         led.set_low();
-        log::info!("Received packet:{:?}", packet);
-        EsbRadioRx::reuse_rx_packet(packet);
+        match event {
+          ERadioEvent::Data(packet) => {
+            log::info!("Received packet:{:?}", packet);
+            EsbRadioEvent::reuse_rx_packet(packet);
+          }
+          ERadioEvent::AckReporting(report) => {
+            log::info!("Received reporting: {:?}", report)
+          }
+        }
         Timer::after_millis(50).await;
         led.set_high();
-        counter += 1;
-        if counter == 128 {
-          counter = 32;
+        data0 += 1;
+        if data0 == 128 {
+          data0 = 32;
         }
         let mut data = [b'c'; 10];
-        data[0] = counter;
-        _ = EsbRadioAck::try_send(EsbPacket::tx_packet(&data, 2, true));
+        data[0] = data0;
+        _ = EsbRadioAck::try_send(EsbPacket::ack_packet(&data, 2, counter));
+        counter += 1;
     }
 }
 #[embassy_executor::task]
@@ -176,9 +187,9 @@ async fn main(spawner: Spawner) {
       log::info!("Initialization error of esb radio: {:?}",e);
     }
 
-    //_ = spawner.spawn(radio_tx_task(led_blue)); 
+    //_ = spawner.spawn(test_commands_task(led_blue)); 
     _ = spawner.spawn(alive_task());
-    _ = spawner.spawn(radio_rx_task(led_green));
+    _ = spawner.spawn(test_events_task(led_green));
     _ = spawner.spawn(radio_driver_task(esb_radio, led_red));
 
     // Run everything concurrently.
