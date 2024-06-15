@@ -51,8 +51,9 @@ async fn test_commands_task(mut led: Output<'static> ) {
     loop {
         led.set_low();
         log::info!("App: Sending # {}", counter);
-        let bytes = "Hello World Radio ESB ".as_bytes();
-        let packet = EsbPacket::tx_packet(&bytes, 1, true);
+        //let bytes = "Hello World Radio ESB ".as_bytes();
+        let bytes = [0x41_u8, 0x62, 0x63];
+        let packet = EsbPacket::tx_packet(&bytes, 2, false);
         EsbRadioCommand::send(ERadioCommand::Data(packet)).await; 
         Timer::after_millis(100).await;
         led.set_high();
@@ -70,11 +71,13 @@ async fn test_events_task(mut led: Output<'static>) {
     for _i in 0..5 {
       EsbRadioEvent::reuse_rx_packet(EsbPacket::empty());
     }
-    for i in 0..5 {
-      let mut data = [b'c'; 10];
-      data[0] = b'a' + i;
-      EsbRadioAck::send(EsbPacket::ack_packet(&data, 2, counter)).await;
-      counter += 1;
+    for _ in 0..2 {
+      for i in 0..5 {
+        let mut data = [b'c'; 10];
+        data[0] = b'a' + i;
+        EsbRadioAck::send(EsbPacket::ack_packet(&data, i, counter)).await;
+        counter += 1;
+      }
     }
     // EsbRadioCommand::send(ERadioCommand::AckReporting(true)).await; // not yet functional. hangs!!
 
@@ -85,22 +88,23 @@ async fn test_events_task(mut led: Output<'static>) {
         match event {
           ERadioEvent::Data(packet) => {
             log::info!("Received packet:{:?}", packet);
+            data0 += 1;
+            if data0 == 128 {
+              data0 = 32;
+            }
+            let mut data = [b'c'; 10];
+            data[0] = data0;
+            _ = EsbRadioAck::try_send(EsbPacket::ack_packet(&data, packet.pipe_nr(), counter));
+            counter += 1;
             EsbRadioEvent::reuse_rx_packet(packet);
           }
           ERadioEvent::AckReporting(report) => {
             log::info!("Received reporting: {:?}", report)
           }
+          
         }
         Timer::after_millis(50).await;
         led.set_high();
-        data0 += 1;
-        if data0 == 128 {
-          data0 = 32;
-        }
-        let mut data = [b'c'; 10];
-        data[0] = data0;
-        _ = EsbRadioAck::try_send(EsbPacket::ack_packet(&data, 2, counter));
-        counter += 1;
     }
 }
 #[embassy_executor::task]
@@ -187,7 +191,7 @@ async fn main(spawner: Spawner) {
       log::info!("Initialization error of esb radio: {:?}",e);
     }
 
-    //_ = spawner.spawn(test_commands_task(led_blue)); 
+    _ = spawner.spawn(test_commands_task(led_blue)); 
     _ = spawner.spawn(alive_task());
     _ = spawner.spawn(test_events_task(led_green));
     _ = spawner.spawn(radio_driver_task(esb_radio, led_red));
