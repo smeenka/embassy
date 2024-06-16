@@ -448,42 +448,28 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
     fn transmit(&mut self) -> Result<ERadioState, Error> {
         let regs = T::regs();
         let mut new_radio_state = ERadioState::Idle;
-        let tx_pid = self.inc_tx_pid();
 
-        if let Some(tx_packet) = &mut self.current_tx_packet {
+        if let Some(tx_packet) = &self.current_tx_packet {
             // Note the reference is crucial for the DMA to work!
             let pipe_nr = tx_packet.pipe_nr();
-            tx_packet.set_pid(tx_pid);
 
             if tx_packet.ack() {
+                // Go to RX mode after the transmission
+                regs.shorts.modify(|_, w| w.disabled_rxen().enabled());
                 // note that we are going to reuse the tx packet for the content of the ack!
                 // the dma pointer for easy dma is not changed during the switching from tx to rx
                 new_radio_state = ERadioState::TransmitAck;
                 // arm the no ack received timer
                 self.timer_timeout = Instant::now() + Duration::from_micros((self.retry_delay * 250) as u64);
-                // Go to RX mode after the transmission
-                regs.shorts.modify(|_, w| w.disabled_rxen().enabled());
             } else {
                 new_radio_state = ERadioState::TransmitNoAck;
-                log::info!("TransmitNoAck {} {:?}", pipe_nr, tx_packet);
-                regs.shorts.write(|w| {
-                    w.ready_start()
-                        .enabled()
-                        .end_disable()
-                        .enabled()
-                        .address_rssistart()
-                        .enabled()
-                        .disabled_rssistop()
-                        .enabled()
-                });
+                log::info!("Sending no ack {:x}", tx_packet.dma_pointer());
             }
             // reset relevant events
             regs.events_disabled.reset();
             regs.events_end.reset();
-            regs.events_ready.reset();
 
             unsafe {
-                regs.events_payload.write(|w| w.bits(0));
                 // Set the pipe number for this transmit
                 regs.txaddress.write(|w| w.txaddress().bits(pipe_nr));
                 // enable the receive pipe
@@ -491,28 +477,13 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
                 regs.packetptr.write(|w| w.bits(tx_packet.dma_pointer()));
             }
             // Enable interrupt for transmission disabled
-            regs.intenset.write(|w| w.address().set());
+            regs.intenset.write(|w| w.disabled().set());
             // be sure no instruction reordering after next fence
             compiler_fence(Ordering::SeqCst);
             // trigger the send
             unsafe {
                 regs.tasks_txen.write(|w| w.bits(1));
             }
-            while regs.events_txready.read().bits() == 0 {}
-            unsafe {
-                regs.tasks_start.write(|w| w.bits(1));
-            }
-
-            log::info!("ready ok");
-            // block until he crc ok event did happen
-            //while regs.events_crcok.read().bits() == 0 {}
-            log::info!("crc ok");
-            // block until the crc ok event did happen
-            // block until he disabled event did happen
-            //while regs.events_end.read().bits() == 0 {}
-            log::info!("end ok");
-            //while regs.events_disabled.read().bits() == 0 {}
-            log::info!("disabled ok");
         }
         Ok(new_radio_state)
     }
@@ -522,6 +493,7 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
             let mut state_m = f.borrow_mut();
             state_m.radio_state = radio_state;
         });
+        log::info!("new state: {:?}", radio_state);
     }
 }
 
@@ -529,11 +501,11 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
 pub(crate) fn on_interrupt(regs: &RegisterBlock, state: &State) {
     // reset the cause of this interrupt
     regs.events_disabled.reset();
+    regs.events_end.reset();
     log::info!("I");
 
     state.mutex.lock(|f| {
         let mut state_m = f.borrow_mut();
-        log::info!("I{:?}", state_m.radio_state);
         state_m.timestamp = Instant::now();
         match state_m.radio_state {
             ERadioState::Idle => (),
@@ -616,10 +588,8 @@ pub(crate) fn on_interrupt(regs: &RegisterBlock, state: &State) {
             ERadioState::TransmitAck => {
                 state_m.radio_state = ERadioState::TransmitAckWait;
                 compiler_fence(Ordering::Release);
-                // trigger the listen task
-                unsafe {
-                    regs.tasks_rxen.write(|w| w.bits(1));
-                }
+                // remove the shortcut rx->disabled to rx enable for sending ack with optional payload
+                regs.shorts.modify(|_, w| w.disabled_rxen().disabled());
             }
             ERadioState::TransmitAckWait => {
                 state_m.radio_state = ERadioState::TransmitAckFinished;
@@ -634,11 +604,6 @@ pub(crate) fn on_interrupt(regs: &RegisterBlock, state: &State) {
                 unsafe {
                     regs.intenclr.write(|w| w.bits(0xFFFF_FFFF)); // disable IRQ, the rest handled in driver context
                 }
-                // trigger the receive
-                unsafe {
-                    regs.tasks_rxen.write(|w| w.bits(1));
-                }
-                log::info!("INA");
                 state.event_waker.wake();
             }
             _ => (),
