@@ -137,6 +137,8 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
         regs.shorts.write(|w| {
             w.ready_start()
                 .enabled()
+                .txready_start()
+                .enabled()
                 .end_disable()
                 .enabled()
                 .address_rssistart()
@@ -302,6 +304,8 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
                 Poll::Ready(new_state)
             }
             ERadioState::TransmitAckFinished => {
+                // disarm timeout timer
+                self.timer_timeout = Instant::MAX;
                 if regs.crcstatus.read().crcstatus().is_crcok() {
                     // tx successfull, drop packet
                     if let Some(mut ack_data) = self.current_tx_packet.take() {
@@ -339,20 +343,18 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
             let state_m = f.borrow();
             radio_state = state_m.radio_state;
         });
-        log::info!("R:{:?}", self.retry_counter);
-        self.retry_counter += 1;
-        if self.retry_counter >= self.max_retries {
-            let packet = self.current_tx_packet.take();
-            return Err(Error::NoAckResponse(packet));
-        }
         match radio_state {
             ERadioState::TransmitAckWait | ERadioState::TransmitAck => {
+                log::info!("R:{:?}", self.retry_counter);
+                self.retry_counter += 1;
+                if self.retry_counter >= self.max_retries {
+                    let packet = self.current_tx_packet.take();
+                    return Err(Error::NoAckResponse(packet));
+                }
                 // disarm the interrupt
                 unsafe {
                     regs.intenclr.write(|w| w.bits(0xFFFF_FFFF));
                 }
-                // disarm the radio
-                regs.tasks_disable.write(|w| unsafe { w.bits(1) });
                 // return the new state as got from the transmit
                 return self.transmit();
             }
@@ -447,6 +449,18 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
     /// Change the radio state.
     fn transmit(&mut self) -> Result<ERadioState, Error> {
         let regs = T::regs();
+        unsafe {
+            // disable IRQ (could be armed due to receive state)
+            regs.intenclr.write(|w| w.bits(0xFFFF_FFFF));
+        }
+        // disble radio and wait until actually disabled
+        regs.shorts
+            .modify(|_, w| w.disabled_rxen().disabled().disabled_txen().disabled());
+
+        regs.tasks_disable.write(|w| unsafe { w.bits(1) });
+        while regs.events_disabled.read().bits() == 0 {}
+        compiler_fence(Ordering::SeqCst);
+
         let mut new_radio_state = ERadioState::Idle;
 
         if let Some(tx_packet) = &self.current_tx_packet {
@@ -461,10 +475,12 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
                 new_radio_state = ERadioState::TransmitAck;
                 // arm the no ack received timer
                 self.timer_timeout = Instant::now() + Duration::from_micros((self.retry_delay * 250) as u64);
+                log::info!("Txa {:?}", tx_packet.len());
             } else {
                 new_radio_state = ERadioState::TransmitNoAck;
-                log::info!("Sending no ack {:x}", tx_packet.dma_pointer());
+                log::info!("Tx {:?}", tx_packet.len());
             }
+
             // reset relevant events
             regs.events_disabled.reset();
             regs.events_end.reset();
@@ -478,6 +494,13 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
             }
             // Enable interrupt for transmission disabled
             regs.intenset.write(|w| w.disabled().set());
+
+            // to be sure the state is set before the interrupt can happen, set the state here
+            // possible duplicate, but for sure
+            T::state().mutex.lock(|f| {
+                let mut state_m = f.borrow_mut();
+                state_m.radio_state = new_radio_state;
+            });
             // be sure no instruction reordering after next fence
             compiler_fence(Ordering::SeqCst);
             // trigger the send
@@ -493,7 +516,6 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
             let mut state_m = f.borrow_mut();
             state_m.radio_state = radio_state;
         });
-        log::info!("new state: {:?}", radio_state);
     }
 }
 
@@ -502,11 +524,11 @@ pub(crate) fn on_interrupt(regs: &RegisterBlock, state: &State) {
     // reset the cause of this interrupt
     regs.events_disabled.reset();
     regs.events_end.reset();
-    log::info!("I");
 
     state.mutex.lock(|f| {
         let mut state_m = f.borrow_mut();
         state_m.timestamp = Instant::now();
+        //log::info!("I{:?}", state_m.radio_state);
         match state_m.radio_state {
             ERadioState::Idle => (),
             ERadioState::Receiving => {
@@ -587,9 +609,9 @@ pub(crate) fn on_interrupt(regs: &RegisterBlock, state: &State) {
             }
             ERadioState::TransmitAck => {
                 state_m.radio_state = ERadioState::TransmitAckWait;
-                compiler_fence(Ordering::Release);
                 // remove the shortcut rx->disabled to rx enable for sending ack with optional payload
                 regs.shorts.modify(|_, w| w.disabled_rxen().disabled());
+                compiler_fence(Ordering::Release);
             }
             ERadioState::TransmitAckWait => {
                 state_m.radio_state = ERadioState::TransmitAckFinished;
@@ -597,6 +619,8 @@ pub(crate) fn on_interrupt(regs: &RegisterBlock, state: &State) {
                     regs.intenclr.write(|w| w.bits(0xFFFF_FFFF)); // disable IRQ, the rest handled in driver context
                 }
                 // and then wake the driver statemachine
+                log::info!("W");
+                compiler_fence(Ordering::Release);
                 state.event_waker.wake();
             }
             ERadioState::TransmitNoAck => {
@@ -604,6 +628,7 @@ pub(crate) fn on_interrupt(regs: &RegisterBlock, state: &State) {
                 unsafe {
                     regs.intenclr.write(|w| w.bits(0xFFFF_FFFF)); // disable IRQ, the rest handled in driver context
                 }
+                compiler_fence(Ordering::Release);
                 state.event_waker.wake();
             }
             _ => (),

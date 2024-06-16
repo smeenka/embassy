@@ -51,9 +51,8 @@ async fn test_commands_task(mut led: Output<'static> ) {
     loop {
         led.set_low();
         log::info!("App: Sending # {}", counter);
-        //let bytes = "Hello World Radio ESB ".as_bytes();
-        let bytes = [0x41_u8, 0x62, 0x63];
-        let packet = EsbPacket::tx_packet(&bytes, 2, false);
+        let bytes = "Hello World Radio ESB ".as_bytes();
+        let packet = EsbPacket::tx_packet(&bytes, 2, true);
         EsbRadioCommand::send(ERadioCommand::Data(packet)).await; 
         Timer::after_millis(100).await;
         led.set_high();
