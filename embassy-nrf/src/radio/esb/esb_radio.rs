@@ -308,11 +308,21 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
                 self.timer_timeout = Instant::MAX;
                 if regs.crcstatus.read().crcstatus().is_crcok() {
                     // tx successfull, drop packet
-                    if let Some(mut ack_data) = self.current_tx_packet.take() {
-                        // the tx packet contains the ack message,as the dma pointer did not change
-                        ack_data.set_rssi(regs.rssisample.read().rssisample().bits());
-                        if let Err(_) = CHANNEL_EVENTS.try_send(ERadioEvent::Data(ack_data)) {
-                            return Poll::Ready(Err(Error::ChannelFull));
+                    self.current_tx_packet.take();
+
+                    // fetch rx packet from interrupt context
+                    let mut some_ack_packet = None;
+                    T::state().mutex.lock(|f| {
+                        let mut state_m = f.borrow_mut();
+                        some_ack_packet = state_m.current_ack_packet.take();
+                    });
+                    if let Some(mut ack_data) = some_ack_packet {
+                        if ack_data.len() > 0 {
+                            ack_data.set_rssi(regs.rssisample.read().rssisample().bits());
+                            ack_data.set_retry(self.retry_counter);
+                            if let Err(_) = CHANNEL_EVENTS.try_send(ERadioEvent::Data(ack_data)) {
+                                return Poll::Ready(Err(Error::ChannelFull));
+                            }
                         }
                     }
                     Poll::Ready(Ok(ERadioState::TransmitCheck))
@@ -345,7 +355,7 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
         });
         match radio_state {
             ERadioState::TransmitAckWait | ERadioState::TransmitAck => {
-                log::info!("R:{:?}", self.retry_counter);
+                // log::info!("R:{:?}", self.retry_counter);
                 self.retry_counter += 1;
                 if self.retry_counter >= self.max_retries {
                     let packet = self.current_tx_packet.take();
@@ -475,10 +485,8 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
                 new_radio_state = ERadioState::TransmitAck;
                 // arm the no ack received timer
                 self.timer_timeout = Instant::now() + Duration::from_micros((self.retry_delay * 250) as u64);
-                log::info!("Txa {:?}", tx_packet.len());
             } else {
                 new_radio_state = ERadioState::TransmitNoAck;
-                log::info!("Tx {:?}", tx_packet.len());
             }
 
             // reset relevant events
@@ -495,11 +503,20 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
             // Enable interrupt for transmission disabled
             regs.intenset.write(|w| w.disabled().set());
 
-            // to be sure the state is set before the interrupt can happen, set the state here
-            // possible duplicate, but for sure
             T::state().mutex.lock(|f| {
                 let mut state_m = f.borrow_mut();
+                // to be sure the state is set before the interrupt can happen, set the state here
+                // possible duplicate, but for sure
                 state_m.radio_state = new_radio_state;
+
+                if tx_packet.ack() {
+                    // prepare receive packet for the ack response possible containing data
+                    if state_m.current_ack_packet.is_none() {
+                        let mut packet = EsbPacket::empty();
+                        packet.set_pipe_nr(pipe_nr);
+                        state_m.current_ack_packet = Some(packet);
+                    }
+                }
             });
             // be sure no instruction reordering after next fence
             compiler_fence(Ordering::SeqCst);
@@ -611,6 +628,14 @@ pub(crate) fn on_interrupt(regs: &RegisterBlock, state: &State) {
                 state_m.radio_state = ERadioState::TransmitAckWait;
                 // remove the shortcut rx->disabled to rx enable for sending ack with optional payload
                 regs.shorts.modify(|_, w| w.disabled_rxen().disabled());
+                // Note the reference is crucial for the DMA to work!
+                if let Some(ack) = &mut state_m.current_ack_packet {
+                    // Note that the next step is very time critical, it must be done before the radio turnaround
+                    // from TX to RX is finished (130 us). So it can only be done in interrupt context
+                    unsafe {
+                        regs.packetptr.write(|w| w.bits(ack.dma_pointer()));
+                    }
+                }
                 compiler_fence(Ordering::Release);
             }
             ERadioState::TransmitAckWait => {
@@ -619,7 +644,6 @@ pub(crate) fn on_interrupt(regs: &RegisterBlock, state: &State) {
                     regs.intenclr.write(|w| w.bits(0xFFFF_FFFF)); // disable IRQ, the rest handled in driver context
                 }
                 // and then wake the driver statemachine
-                log::info!("W");
                 compiler_fence(Ordering::Release);
                 state.event_waker.wake();
             }
