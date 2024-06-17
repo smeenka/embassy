@@ -33,7 +33,7 @@ impl Default for EsbConfig {
             prefixes1: [4, 5, 6, 7],
             rf_channel: 90,
             max_retries: 8, // [0, 15]
-            retry_delay: 8, // 1 ms between retries
+            retry_delay: 4, // 1 ms between retries
         }
     }
 }

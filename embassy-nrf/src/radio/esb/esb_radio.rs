@@ -244,7 +244,7 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
             radio_state = state_m.radio_state;
         });
         let regs = T::regs();
-        //log::info!("{:?}", &radio_state);
+        // log::info!("{:?}", &radio_state);
         match radio_state {
             ERadioState::Idle => Poll::Pending,
             ERadioState::ReceivePrepare => match self.receive_prepare() {
@@ -286,10 +286,10 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
                             // a packet was send. The tx pid was incremented in interrupt state, but not yet updated here
                             _ = self.inc_tx_pid();
                         }
-                        p.set_rssi(regs.rssisample.read().rssisample().bits());
                         p.set_pipe_nr(pipe_nr as u8);
                         p.set_retry(self.pipes[pipe_nr].last_rx_retry());
                         // send to application
+                        //log::info!("RSSI: {:?}", p.rssi());
                         if let Err(_) = CHANNEL_EVENTS.try_send(ERadioEvent::Data(p)) {
                             return Poll::Ready(Err(Error::ChannelFull));
                         }
@@ -354,6 +354,21 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
             radio_state = state_m.radio_state;
         });
         match radio_state {
+            ERadioState::Receiving => {
+                log::info!("Receive timeout");
+                // receiving got stuc for whatever reason. Disable radio and retry
+                unsafe {
+                    // disable IRQ (could be armed due to receive state)
+                    regs.intenclr.write(|w| w.bits(0xFFFF_FFFF));
+                }
+                // disble radio and wait until actually disabled
+                regs.shorts
+                    .modify(|_, w| w.disabled_rxen().disabled().disabled_txen().disabled());
+
+                regs.tasks_disable.write(|w| unsafe { w.bits(1) });
+                //while regs.events_disabled.read().bits() == 0 {}
+                return self.receive_prepare();
+            }
             ERadioState::TransmitAckWait | ERadioState::TransmitAck => {
                 // log::info!("R:{:?}", self.retry_counter);
                 self.retry_counter += 1;
@@ -411,8 +426,9 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
                             log::info!("Setting ack reporting to {}", reporting);
                             T::state().mutex.lock(|f| {
                                 let mut state_m = f.borrow_mut();
-                                state_m.ack_reporting = reporting
-                            })
+                                state_m.ack_reporting = reporting;
+                            });
+                            return Ok(ERadioState::TransmitCheck);
                         }
                     }
                 }
@@ -440,6 +456,8 @@ impl<'d, T: Instance> EsbRadio<'d, T> {
                 }
             }
         });
+        // arm the timer to guard agains stuck receive
+        // TODO self.timer_timeout = Instant::now() + Duration::from_secs(5);
         unsafe {
             // Go to TX mode after the reception for sending the ACK
             regs.shorts.modify(|_, w| w.disabled_txen().enabled());
@@ -563,7 +581,7 @@ pub(crate) fn on_interrupt(regs: &RegisterBlock, state: &State) {
                     state.event_waker.wake();
                     return;
                 }
-                if let Some(p) = state_m.current_rx_packet {
+                if let Some(mut p) = state_m.current_rx_packet {
                     // check if the remote node does want to receive an ACK
                     if p.ack() {
                         let pipe_nr = regs.rxmatch.read().rxmatch().bits() as usize;
@@ -599,7 +617,6 @@ pub(crate) fn on_interrupt(regs: &RegisterBlock, state: &State) {
                                 regs.txaddress.write(|w| w.txaddress().bits(pipe_nr as u8));
                             }
                         }
-                        compiler_fence(Ordering::Release);
                         // handle option ack reporting after the dma pointer is set, so a bit extra time in the interrupt does not hurt
                         if state_m.ack_reporting {
                             if let Some(p) = previous_packet {
@@ -608,9 +625,13 @@ pub(crate) fn on_interrupt(regs: &RegisterBlock, state: &State) {
                             }
                         }
                         state_m.radio_state = ERadioState::ReceiveTransmitAck;
+                        compiler_fence(Ordering::Release);
                     } else {
                         state_m.radio_state = ERadioState::ReceiveFinished
                     }
+                    // fetch the rssi just after the packet is received
+                    p.set_rssi(regs.rssisample.read().rssisample().bits());
+                    state_m.current_rx_packet = Some(p);
                 }
                 // remove the shortcut rx->disabled to tx enable for sending the ack
                 regs.shorts.modify(|_, w| w.disabled_txen().disabled());

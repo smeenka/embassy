@@ -52,7 +52,7 @@ async fn test_commands_task(mut led: Output<'static> ) {
         led.set_low();
         log::info!("App: Sending # {}", counter);
         let bytes = "Hello World Radio ESB ".as_bytes();
-        let packet = EsbPacket::tx_packet(&bytes, 2, true);
+        let packet = EsbPacket::tx_packet(&bytes, 1, true);
         EsbRadioCommand::send(ERadioCommand::Data(packet)).await; 
         Timer::after_millis(100).await;
         led.set_high();
@@ -78,7 +78,7 @@ async fn test_events_task(mut led: Output<'static>) {
         counter += 1;
       }
     }
-    // EsbRadioCommand::send(ERadioCommand::AckReporting(true)).await; // not yet functional. hangs!!
+    EsbRadioCommand::send(ERadioCommand::AckReporting(true)).await;
 
     log::info!("Waiting for incoming events");
     loop {
@@ -86,7 +86,7 @@ async fn test_events_task(mut led: Output<'static>) {
         led.set_low();
         match event {
           ERadioEvent::Data(packet) => {
-            log::info!("Received packet:{:?}", packet);
+            log::info!("Received packet. {:?}", packet);
             data0 += 1;
             if data0 == 128 {
               data0 = 32;
@@ -190,7 +190,7 @@ async fn main(spawner: Spawner) {
       log::info!("Initialization error of esb radio: {:?}",e);
     }
 
-    _ = spawner.spawn(test_commands_task(led_blue)); 
+    //_ = spawner.spawn(test_commands_task(led_blue)); 
     _ = spawner.spawn(alive_task());
     _ = spawner.spawn(test_events_task(led_green));
     _ = spawner.spawn(radio_driver_task(esb_radio, led_red));
