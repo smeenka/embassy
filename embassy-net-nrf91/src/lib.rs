@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(unsafe_op_in_unsafe_fn)]
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 #![deny(unused_must_use)]
@@ -9,20 +10,20 @@ mod fmt;
 pub mod context;
 
 use core::cell::RefCell;
-use core::future::poll_fn;
+use core::future::{Future, poll_fn};
 use core::marker::PhantomData;
 use core::mem::{self, MaybeUninit};
 use core::ptr::{self, addr_of, addr_of_mut, copy_nonoverlapping};
 use core::slice;
-use core::sync::atomic::{compiler_fence, fence, Ordering};
+use core::sync::atomic::{Ordering, compiler_fence, fence};
 use core::task::{Poll, Waker};
 
+use cortex_m::peripheral::NVIC;
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::pipe;
 use embassy_sync::waitqueue::{AtomicWaker, WakerRegistration};
 use heapless::Vec;
-use pac::NVIC;
-use {embassy_net_driver_channel as ch, nrf9160_pac as pac};
+use {embassy_net_driver_channel as ch, nrf_pac as pac};
 
 const RX_SIZE: usize = 8 * 1024;
 const TRACE_SIZE: usize = 16 * 1024;
@@ -38,11 +39,9 @@ static WAKER: AtomicWaker = AtomicWaker::new();
 
 /// Call this function on IPC IRQ
 pub fn on_ipc_irq() {
-    let ipc = unsafe { &*pac::IPC_NS::ptr() };
-
     trace!("irq");
 
-    ipc.inten.write(|w| w);
+    pac::IPC_NS.inten().write(|_| ());
     WAKER.wake();
 }
 
@@ -121,49 +120,59 @@ async fn new_internal<'a>(
     let shmem_ptr = shmem.as_mut_ptr() as *mut u8;
 
     const SPU_REGION_SIZE: usize = 8192; // 8kb
-    assert!(shmem_len != 0);
+    trace!("  shmem_ptr = {}, shmem_len = {}", shmem_ptr, shmem_len);
+
+    assert!(shmem_len != 0, "shmem length must not be zero");
     assert!(
         shmem_len % SPU_REGION_SIZE == 0,
         "shmem length must be a multiple of 8kb"
     );
     assert!(
         (shmem_ptr as usize) % SPU_REGION_SIZE == 0,
-        "shmem length must be a multiple of 8kb"
+        "shmem pointer must be 8kb-aligned"
     );
     assert!(
         (shmem_ptr as usize + shmem_len) < 0x2002_0000,
         "shmem must be in the lower 128kb of RAM"
     );
 
-    let spu = unsafe { &*pac::SPU_S::ptr() };
+    let spu = pac::SPU_S;
     debug!("Setting IPC RAM as nonsecure...");
+    trace!(
+        "  SPU_REGION_SIZE={}, shmem_ptr=0x{:08X}, shmem_len={}",
+        SPU_REGION_SIZE, shmem_ptr as usize, shmem_len
+    );
     let region_start = (shmem_ptr as usize - 0x2000_0000) / SPU_REGION_SIZE;
     let region_end = region_start + shmem_len / SPU_REGION_SIZE;
+    trace!("  region_start={}, region_end={}", region_start, region_end);
     for i in region_start..region_end {
-        spu.ramregion[i].perm.write(|w| {
-            w.execute().set_bit();
-            w.write().set_bit();
-            w.read().set_bit();
-            w.secattr().clear_bit();
-            w.lock().clear_bit();
-            w
+        spu.ramregion(i).perm().write(|w| {
+            w.set_execute(true);
+            w.set_write(true);
+            w.set_read(true);
+            w.set_secattr(false);
+            w.set_lock(false);
         })
     }
 
-    spu.periphid[42].perm.write(|w| w.secattr().non_secure());
+    spu.periphid(42).perm().write(|w| w.set_secattr(false));
 
     let mut alloc = Allocator {
         start: shmem_ptr,
         end: unsafe { shmem_ptr.add(shmem_len) },
         _phantom: PhantomData,
     };
-
-    let ipc = unsafe { &*pac::IPC_NS::ptr() };
-    let power = unsafe { &*pac::POWER_S::ptr() };
+    trace!(
+        "  Allocator: start=0x{:08X}, end=0x{:08X}",
+        alloc.start as usize, alloc.end as usize
+    );
 
     let cb: &mut ControlBlock = alloc.alloc().write(unsafe { mem::zeroed() });
+
     let rx = alloc.alloc_bytes(RX_SIZE);
+    trace!("  RX buffer at {}, size={}", rx.as_ptr(), RX_SIZE);
     let trace = alloc.alloc_bytes(TRACE_SIZE);
+    trace!("  Trace buffer at {}, size={}", trace.as_ptr(), TRACE_SIZE);
 
     cb.version = 0x00010000;
     cb.rx_base = rx.as_mut_ptr() as _;
@@ -177,21 +186,24 @@ async fn new_internal<'a>(
     cb.trace.base = trace.as_mut_ptr() as _;
     cb.trace.size = TRACE_SIZE;
 
-    ipc.gpmem[0].write(|w| unsafe { w.bits(cb as *mut _ as u32) });
-    ipc.gpmem[1].write(|w| unsafe { w.bits(0) });
+    let ipc = pac::IPC_NS;
+    ipc.gpmem(0).write_value(cb as *mut _ as u32);
+    ipc.gpmem(1).write_value(0);
+    trace!("  GPMEM[0]={:#X}, GPMEM[1]={}", cb as *mut _ as u32, 0);
 
     // connect task/event i to channel i
     for i in 0..8 {
-        ipc.send_cnf[i].write(|w| unsafe { w.bits(1 << i) });
-        ipc.receive_cnf[i].write(|w| unsafe { w.bits(1 << i) });
+        ipc.send_cnf(i).write(|w| w.0 = 1 << i);
+        ipc.receive_cnf(i).write(|w| w.0 = 1 << i);
     }
 
     compiler_fence(Ordering::SeqCst);
 
-    // POWER.LTEMODEM.STARTN = 0
-    // The reg is missing in the PAC??
-    let startn = unsafe { (power as *const _ as *mut u32).add(0x610 / 4) };
-    unsafe { startn.write_volatile(0) }
+    let power = pac::POWER_S;
+    power
+        .ltemodem()
+        .startn()
+        .write(|w| w.set_startn(pac::power::vals::Startn::START));
 
     unsafe { NVIC::unmask(pac::Interrupt::IPC) };
 
@@ -201,9 +213,12 @@ async fn new_internal<'a>(
         cb,
         requests: [const { None }; REQ_COUNT],
         next_req_serial: 0x12345678,
+        net_fd: None,
 
         rx_control_list: ptr::null_mut(),
         rx_data_list: ptr::null_mut(),
+        rx_control_len: 0,
+        rx_data_len: 0,
         rx_seq_no: 0,
         rx_check: PointerChecker {
             start: rx.as_mut_ptr() as *mut u8,
@@ -212,6 +227,7 @@ async fn new_internal<'a>(
 
         tx_seq_no: 0,
         tx_buf_used: [false; TX_BUF_COUNT],
+        tx_waker: WakerRegistration::new(),
 
         trace_chans: Vec::new(),
         trace_check: PointerChecker {
@@ -220,11 +236,13 @@ async fn new_internal<'a>(
         },
     }));
 
-    let control = Control { state: state_inner };
-
     let (ch_runner, device) = ch::new(&mut state.ch, ch::driver::HardwareAddress::Ip);
     let state_ch = ch_runner.state_runner();
-    state_ch.set_link_state(ch::driver::LinkState::Up);
+
+    let control = Control {
+        state: state_inner,
+        state_ch,
+    };
 
     let (trace_reader, trace_writer) = if let Some(trace) = trace_buffer {
         let (r, w) = trace.trace.split();
@@ -295,7 +313,7 @@ struct PendingRequest {
     waker: Waker,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 struct NoFreeBufs;
 
@@ -307,13 +325,20 @@ struct StateInner {
     requests: [Option<PendingRequest>; REQ_COUNT],
     next_req_serial: u32,
 
+    net_fd: Option<u32>,
+
     rx_control_list: *mut List,
     rx_data_list: *mut List,
+    /// Number of entries in the control list
+    rx_control_len: usize,
+    /// Number of entries in the data list
+    rx_data_len: usize,
     rx_seq_no: u16,
     rx_check: PointerChecker,
 
     tx_seq_no: u16,
     tx_buf_used: [bool; TX_BUF_COUNT],
+    tx_waker: WakerRegistration,
 
     trace_chans: Vec<TraceChannelInfo, TRACE_CHANNEL_COUNT>,
     trace_check: PointerChecker,
@@ -322,15 +347,15 @@ struct StateInner {
 impl StateInner {
     fn poll(&mut self, trace_writer: &mut Option<TraceWriter<'_>>, ch: &mut ch::Runner<MTU>) {
         trace!("poll!");
-        let ipc = unsafe { &*pac::IPC_NS::ptr() };
+        let ipc = pac::IPC_NS;
 
-        if ipc.events_receive[0].read().bits() != 0 {
-            ipc.events_receive[0].reset();
+        if ipc.events_receive(0).read() != 0 {
+            ipc.events_receive(0).write_value(0);
             trace!("ipc 0");
         }
 
-        if ipc.events_receive[2].read().bits() != 0 {
-            ipc.events_receive[2].reset();
+        if ipc.events_receive(2).read() != 0 {
+            ipc.events_receive(2).write_value(0);
             trace!("ipc 2");
 
             if !self.init {
@@ -344,8 +369,11 @@ impl StateInner {
                 self.rx_data_list = desc.data_list_ptr;
                 let rx_control_len = unsafe { addr_of!((*self.rx_control_list).len).read_volatile() };
                 let rx_data_len = unsafe { addr_of!((*self.rx_data_list).len).read_volatile() };
-                assert_eq!(rx_control_len, LIST_LEN);
-                assert_eq!(rx_data_len, LIST_LEN);
+
+                trace!("modem control list length: {}", rx_control_len);
+                trace!("modem data    list length: {}", rx_data_len);
+                self.rx_control_len = rx_control_len;
+                self.rx_data_len = rx_data_len;
                 self.init = true;
 
                 debug!("IPC initialized OK!");
@@ -353,8 +381,8 @@ impl StateInner {
             }
         }
 
-        if ipc.events_receive[4].read().bits() != 0 {
-            ipc.events_receive[4].reset();
+        if ipc.events_receive(4).read() != 0 {
+            ipc.events_receive(4).write_value(0);
             trace!("ipc 4");
 
             loop {
@@ -368,13 +396,13 @@ impl StateInner {
             }
         }
 
-        if ipc.events_receive[6].read().bits() != 0 {
-            ipc.events_receive[6].reset();
+        if ipc.events_receive(6).read() != 0 {
+            ipc.events_receive(6).write_value(0);
             trace!("ipc 6");
         }
 
-        if ipc.events_receive[7].read().bits() != 0 {
-            ipc.events_receive[7].reset();
+        if ipc.events_receive(7).read() != 0 {
+            ipc.events_receive(7).write_value(0);
             trace!("ipc 7: trace");
 
             let msg = unsafe { addr_of!((*self.cb).trace.rx_state).read_volatile() };
@@ -437,13 +465,12 @@ impl StateInner {
             }
         }
 
-        ipc.intenset.write(|w| {
-            w.receive0().set_bit();
-            w.receive2().set_bit();
-            w.receive4().set_bit();
-            w.receive6().set_bit();
-            w.receive7().set_bit();
-            w
+        ipc.intenset().write(|w| {
+            w.set_receive0(true);
+            w.set_receive2(true);
+            w.set_receive4(true);
+            w.set_receive6(true);
+            w.set_receive7(true);
         });
     }
 
@@ -462,7 +489,12 @@ impl StateInner {
 
     fn process(&mut self, list: *mut List, is_control: bool, ch: &mut ch::Runner<MTU>) -> bool {
         let mut did_work = false;
-        for i in 0..LIST_LEN {
+        let max = if is_control {
+            self.rx_control_len
+        } else {
+            self.rx_data_len
+        };
+        for i in 0..max {
             let item_ptr = unsafe { addr_of_mut!((*list).items[i]) };
             let preamble = unsafe { addr_of!((*item_ptr).state).read_volatile() };
             if preamble & 0xFF == 0x01 && preamble >> 16 == self.rx_seq_no as u32 {
@@ -511,6 +543,7 @@ impl StateInner {
         if data.is_empty() {
             msg.data = ptr::null_mut();
             msg.data_len = 0;
+            self.send_message_raw(msg)
         } else {
             assert!(data.len() <= TX_BUF_SIZE);
             let buf_idx = self.find_free_tx_buf().ok_or(NoFreeBufs)?;
@@ -521,10 +554,16 @@ impl StateInner {
             self.tx_buf_used[buf_idx] = true;
 
             fence(Ordering::SeqCst); // synchronize copy_nonoverlapping (non-volatile) with volatile writes below.
+            if let Err(e) = self.send_message_raw(msg) {
+                msg.data = ptr::null_mut();
+                msg.data_len = 0;
+                self.tx_buf_used[buf_idx] = false;
+                self.tx_waker.wake();
+                Err(e)
+            } else {
+                Ok(())
+            }
         }
-
-        // TODO free data buf if send_message_raw fails.
-        self.send_message_raw(msg)
     }
 
     fn send_message_raw(&mut self, msg: &Message) -> Result<(), NoFreeBufs> {
@@ -546,8 +585,8 @@ impl StateInner {
         unsafe { addr_of_mut!((*list_item).state).write_volatile((self.tx_seq_no as u32) << 16 | 0x01) }
         self.tx_seq_no = self.tx_seq_no.wrapping_add(1);
 
-        let ipc = unsafe { &*pac::IPC_NS::ptr() };
-        ipc.tasks_send[ipc_ch].write(|w| unsafe { w.bits(1) });
+        let ipc = pac::IPC_NS;
+        ipc.tasks_send(ipc_ch).write_value(1);
         Ok(())
     }
 
@@ -584,6 +623,7 @@ impl StateInner {
             );
         }
         self.tx_buf_used[idx] = false;
+        self.tx_waker.wake();
     }
 
     fn handle_data(&mut self, msg: &Message, ch: &mut ch::Runner<MTU>) {
@@ -724,11 +764,12 @@ impl PointerChecker {
 /// You can use this object to control the modem at runtime, such as running AT commands.
 pub struct Control<'a> {
     state: &'a RefCell<StateInner>,
+    state_ch: ch::StateRunner<'a>,
 }
 
 impl<'a> Control<'a> {
     /// Wait for modem IPC to be initialized.
-    pub async fn wait_init(&self) {
+    pub fn wait_init(&self) -> impl Future<Output = ()> + '_ {
         poll_fn(|cx| {
             let mut state = self.state.borrow_mut();
             if state.init {
@@ -737,7 +778,6 @@ impl<'a> Control<'a> {
             state.init_waker.register(cx.waker());
             Poll::Pending
         })
-        .await
     }
 
     async fn request(&self, msg: &mut Message, req_data: &[u8], resp_data: &mut [u8]) -> usize {
@@ -759,10 +799,22 @@ impl<'a> Control<'a> {
             state.next_req_serial = state.next_req_serial.wrapping_add(1);
         }
 
+        drop(state); // don't borrow state across awaits.
+
         msg.param[0..4].copy_from_slice(&req_serial.to_le_bytes());
-        unwrap!(state.send_message(msg, req_data));
+
+        poll_fn(|cx| {
+            let mut state = self.state.borrow_mut();
+            state.tx_waker.register(cx.waker());
+            match state.send_message(msg, req_data) {
+                Ok(_) => Poll::Ready(()),
+                Err(NoFreeBufs) => Poll::Pending,
+            }
+        })
+        .await;
 
         // Setup the pending request state.
+        let mut state = self.state.borrow_mut();
         let (req_slot_idx, req_slot) = state
             .requests
             .iter_mut()
@@ -867,6 +919,8 @@ impl<'a> Control<'a> {
         assert_eq!(status, 0);
         assert_eq!(msg.param_len, 16);
         let fd = u32::from_le_bytes(msg.param[12..16].try_into().unwrap());
+        self.state.borrow_mut().net_fd.replace(fd);
+
         trace!("got FD: {}", fd);
         fd
     }
@@ -884,6 +938,10 @@ impl<'a> Control<'a> {
         assert!(msg.param_len >= 12);
         let status = u32::from_le_bytes(msg.param[8..12].try_into().unwrap());
         assert_eq!(status, 0);
+    }
+
+    fn set_link_state(&self, state: ch::driver::LinkState) {
+        self.state_ch.set_link_state(state);
     }
 }
 
@@ -906,16 +964,17 @@ impl<'a> Runner<'a> {
             state.poll(&mut self.trace_writer, &mut self.ch);
 
             if let Poll::Ready(buf) = self.ch.poll_tx_buf(cx) {
-                let fd = 128u32; // TODO unhardcode
-                let mut msg: Message = unsafe { mem::zeroed() };
-                msg.channel = 2; // data
-                msg.id = 0x7006_0004; // IP send
-                msg.param_len = 12;
-                msg.param[4..8].copy_from_slice(&fd.to_le_bytes());
-                if let Err(e) = state.send_message(&mut msg, buf) {
-                    warn!("tx failed: {:?}", e);
+                if let Some(fd) = state.net_fd {
+                    let mut msg: Message = unsafe { mem::zeroed() };
+                    msg.channel = 2; // data
+                    msg.id = 0x7006_0004; // IP send
+                    msg.param_len = 12;
+                    msg.param[4..8].copy_from_slice(&fd.to_le_bytes());
+                    if let Err(e) = state.send_message(&mut msg, buf) {
+                        warn!("tx failed: {:?}", e);
+                    }
+                    self.ch.tx_done();
                 }
-                self.ch.tx_done();
             }
 
             Poll::Pending
@@ -924,7 +983,7 @@ impl<'a> Runner<'a> {
     }
 }
 
-const LIST_LEN: usize = 16;
+const LIST_LEN: usize = 32;
 
 #[repr(C)]
 struct ControlBlock {
@@ -1009,7 +1068,8 @@ struct ListItem {
 }
 
 #[repr(C)]
-#[derive(defmt::Format, Clone, Copy)]
+#[derive(Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 struct Message {
     id: u32,
 

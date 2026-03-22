@@ -11,11 +11,12 @@ use defmt::{info, unwrap, warn};
 use embassy_executor::Spawner;
 use embassy_net::{Ipv4Cidr, Stack, StackResources};
 use embassy_net_nrf91::context::Status;
-use embassy_net_nrf91::{context, Runner, State, TraceBuffer, TraceReader};
+use embassy_net_nrf91::{Runner, State, TraceBuffer, TraceReader, context};
 use embassy_nrf::buffered_uarte::{self, BufferedUarteTx};
-use embassy_nrf::gpio::{AnyPin, Level, Output, OutputDrive, Pin};
+use embassy_nrf::cryptocell_rng::CcRng;
+use embassy_nrf::gpio::{AnyPin, Level, Output, OutputDrive};
 use embassy_nrf::uarte::Baudrate;
-use embassy_nrf::{bind_interrupts, interrupt, peripherals, uarte};
+use embassy_nrf::{Peri, bind_interrupts, interrupt, peripherals, uarte};
 use embassy_time::{Duration, Timer};
 use embedded_io_async::Write;
 use heapless::Vec;
@@ -28,11 +29,11 @@ fn IPC() {
 }
 
 bind_interrupts!(struct Irqs {
-    UARTE0_SPIM0_SPIS0_TWIM0_TWIS0 => buffered_uarte::InterruptHandler<peripherals::SERIAL0>;
+    SERIAL0 => buffered_uarte::InterruptHandler<peripherals::SERIAL0>;
 });
 
 #[embassy_executor::task]
-async fn trace_task(mut uart: BufferedUarteTx<'static, peripherals::SERIAL0>, reader: TraceReader<'static>) -> ! {
+async fn trace_task(mut uart: BufferedUarteTx<'static>, reader: TraceReader<'static>) -> ! {
     let mut rx = [0u8; 1024];
     loop {
         let n = reader.read(&mut rx[..]).await;
@@ -91,7 +92,7 @@ fn status_to_config(status: &Status) -> embassy_net::ConfigV4 {
 }
 
 #[embassy_executor::task]
-async fn blink_task(pin: AnyPin) {
+async fn blink_task(pin: Peri<'static, AnyPin>) {
     let mut led = Output::new(pin, Level::Low, OutputDrive::Standard);
     loop {
         led.set_high();
@@ -101,7 +102,7 @@ async fn blink_task(pin: AnyPin) {
     }
 }
 
-extern "C" {
+unsafe extern "C" {
     static __start_ipc: u8;
     static __end_ipc: u8;
 }
@@ -112,7 +113,7 @@ async fn main(spawner: Spawner) {
 
     info!("Hello World!");
 
-    unwrap!(spawner.spawn(blink_task(p.P0_02.degrade())));
+    spawner.spawn(unwrap!(blink_task(p.P0_02.into())));
 
     let ipc_mem = unsafe {
         let ipc_start = &__start_ipc as *const u8 as *mut MaybeUninit<u8>;
@@ -127,8 +128,8 @@ async fn main(spawner: Spawner) {
     let uart = BufferedUarteTx::new(
         //let trace_uart = BufferedUarteTx::new(
         unsafe { peripherals::SERIAL0::steal() },
-        Irqs,
         unsafe { peripherals::P0_01::steal() },
+        Irqs,
         //unsafe { peripherals::P0_14::steal() },
         config,
         unsafe { &mut *addr_of_mut!(TRACE_BUF) },
@@ -138,24 +139,25 @@ async fn main(spawner: Spawner) {
     static TRACE: StaticCell<TraceBuffer> = StaticCell::new();
     let (device, control, runner, tracer) =
         embassy_net_nrf91::new_with_trace(STATE.init(State::new()), ipc_mem, TRACE.init(TraceBuffer::new())).await;
-    unwrap!(spawner.spawn(modem_task(runner)));
-    unwrap!(spawner.spawn(trace_task(uart, tracer)));
+    spawner.spawn(unwrap!(modem_task(runner)));
+    spawner.spawn(unwrap!(trace_task(uart, tracer)));
 
     let config = embassy_net::Config::default();
 
-    // Generate "random" seed. nRF91 has no RNG, TODO figure out something...
-    let seed = 123456;
+    // Generate random seed.
+    let mut rng = CcRng::new_blocking(p.CC_RNG);
+    let seed = rng.blocking_next_u64();
 
     // Init network stack
     static RESOURCES: StaticCell<StackResources<2>> = StaticCell::new();
     let (stack, runner) = embassy_net::new(device, config, RESOURCES.init(StackResources::<2>::new()), seed);
 
-    unwrap!(spawner.spawn(net_task(runner)));
+    spawner.spawn(unwrap!(net_task(runner)));
 
     static CONTROL: StaticCell<context::Control<'static>> = StaticCell::new();
     let control = CONTROL.init(context::Control::new(control, 0).await);
 
-    unwrap!(spawner.spawn(control_task(
+    spawner.spawn(unwrap!(control_task(
         control,
         context::Config {
             apn: b"iot.nat.es",

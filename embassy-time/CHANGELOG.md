@@ -5,12 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+<!-- next-header -->
+## Unreleased - ReleaseDate
+
+## 0.5.1 - 2026-03-11
+
+- Add `as_nanos` and `from_nanos` where missing
+- Add `Instant::try_from_nanos`
+- Added 375KHz tick rate support
+- Upgrade embassy-executor to 0.10.0
+
+## 0.5.0 - 2025-08-26
+
+- Allow inlining on time driver boundary
+- Add `saturating_add` and `saturating_sub` to `Instant`
+- Add `Instant::try_from_*` constructor functions
+- Add `Duration::try_from_*` constructor functions
+- Don't select `critical-section` impl for `std`
+- Manually implement the future for `with_timeout`
+- Add 133MHz tick rate to support PR2040 @ 133MHz when `TIMERx`'s `SOURCE` is set to `SYSCLK`
+- Implement Sum for Duration
+
+## 0.4.0 - 2025-01-02
+
+- `embassy-time-driver` updated from v0.1 to v0.2.
+- embassy-time no longer provides an `embassy-time-queue-driver` implementation
 
 ## 0.3.2 - 2024-08-05
 
 - Implement with_timeout()/with_deadline() method style call on Future
-- Add collapse_debuginfo to fmt.rs macros. 
+- Add collapse_debuginfo to fmt.rs macros.
 
 ## 0.3.1 - 2024-01-11
 

@@ -71,11 +71,28 @@ impl Registers {
         }
     }
 
+    #[cfg(feature = "time")]
+    pub fn calc_timestamp(&self, ns_per_timer_tick: u64, ts_val: u16) -> Timestamp {
+        let now_embassy = embassy_time::Instant::now();
+        if ns_per_timer_tick == 0 {
+            return now_embassy;
+        }
+        let cantime = { self.regs.tscv().read().tsc() };
+        let delta = cantime.overflowing_sub(ts_val).0 as u64;
+        let ns = ns_per_timer_tick * delta as u64;
+        now_embassy - embassy_time::Duration::from_nanos(ns)
+    }
+
+    #[cfg(not(feature = "time"))]
+    pub fn calc_timestamp(&self, _ns_per_timer_tick: u64, ts_val: u16) -> Timestamp {
+        ts_val
+    }
+
     pub fn put_tx_frame(&self, bufidx: usize, header: &Header, buffer: &[u8]) {
         let mailbox = self.tx_buffer_element(bufidx);
         mailbox.reset();
         put_tx_header(mailbox, header);
-        put_tx_data(mailbox, &buffer[..header.len() as usize]);
+        put_tx_data(mailbox, buffer);
 
         // Set <idx as Mailbox> as ready to transmit
         self.regs.txbar().modify(|w| w.set_ar(bufidx, true));
@@ -83,37 +100,29 @@ impl Registers {
 
     fn reg_to_error(value: u8) -> Option<BusError> {
         match value {
-            //0b000 => None,
+            // 0b000 => None,
             0b001 => Some(BusError::Stuff),
             0b010 => Some(BusError::Form),
             0b011 => Some(BusError::Acknowledge),
             0b100 => Some(BusError::BitRecessive),
             0b101 => Some(BusError::BitDominant),
             0b110 => Some(BusError::Crc),
-            //0b111 => Some(BusError::NoError),
+            // 0b111 => Some(BusError::NoError),
             _ => None,
         }
     }
 
     pub fn curr_error(&self) -> Option<BusError> {
         let err = { self.regs.psr().read() };
-        if err.bo() {
-            return Some(BusError::BusOff);
-        } else if err.ep() {
-            return Some(BusError::BusPassive);
-        } else if err.ew() {
-            return Some(BusError::BusWarning);
-        } else {
-            cfg_if! {
-                if #[cfg(can_fdcan_h7)] {
-                    let lec = err.lec();
-                } else {
-                    let lec = err.lec().to_bits();
-                }
+        cfg_if! {
+            if #[cfg(can_fdcan_h7)] {
+                let lec = err.lec();
+            } else {
+                let lec = err.lec().to_bits();
             }
-            if let Some(err) = Self::reg_to_error(lec) {
-                return Some(err);
-            }
+        }
+        if let Some(err) = Self::reg_to_error(lec) {
+            return Some(err);
         }
         None
     }
@@ -190,7 +199,7 @@ impl Registers {
                 DataLength::Fdcan(len) => len,
                 DataLength::Classic(len) => len,
             };
-            if len as usize > ClassicData::MAX_DATA_LEN {
+            if len as usize > 8 {
                 return None;
             }
 
@@ -458,7 +467,7 @@ impl Registers {
     /// [`FdCanConfig::set_transmit_pause`]
     #[inline]
     pub fn set_transmit_pause(&self, enabled: bool) {
-        self.regs.cccr().modify(|w| w.set_txp(!enabled));
+        self.regs.cccr().modify(|w| w.set_txp(enabled));
     }
 
     /// Configures non-iso mode. See [`FdCanConfig::set_non_iso_mode`]

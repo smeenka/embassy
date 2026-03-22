@@ -8,10 +8,11 @@ mod common;
 use common::*;
 use embassy_executor::Spawner;
 use embassy_stm32::peripherals::*;
-use embassy_stm32::{bind_interrupts, can, Config};
+use embassy_stm32::{Config, bind_interrupts, can};
 use embassy_time::Duration;
 use {defmt_rtt as _, panic_probe as _};
 
+#[path = "../can_common.rs"]
 mod can_common;
 use can_common::*;
 
@@ -100,7 +101,11 @@ fn options() -> (Config, TestOptions) {
     )
 }
 
-#[embassy_executor::main]
+#[cfg_attr(
+    feature = "stop",
+    embassy_executor::main(executor = "embassy_stm32::executor::Executor", entry = "cortex_m_rt::entry")
+)]
+#[cfg_attr(not(feature = "stop"), embassy_executor::main)]
 async fn main(_spawner: Spawner) {
     //let peripherals = init();
 

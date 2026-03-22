@@ -3,6 +3,7 @@ pub use crate::pac::rcc::vals::{
     Hpre as AHBPrescaler, Hsidiv as HsiSysDiv, Hsikerdiv as HsiKerDiv, Ppre as APBPrescaler, Sw as Sysclk,
 };
 use crate::pac::{FLASH, RCC};
+use crate::rcc::LSI_FREQ;
 use crate::time::Hertz;
 
 /// HSI speed
@@ -48,6 +49,10 @@ pub struct Config {
     /// System Clock Configuration
     pub sys: Sysclk,
 
+    /// HSI48 Configuration
+    #[cfg(crs)]
+    pub hsi48: Option<super::Hsi48Config>,
+
     pub ahb_pre: AHBPrescaler,
     pub apb1_pre: APBPrescaler,
 
@@ -58,9 +63,8 @@ pub struct Config {
     pub mux: super::mux::ClockMux,
 }
 
-impl Default for Config {
-    #[inline]
-    fn default() -> Config {
+impl Config {
+    pub const fn new() -> Self {
         Config {
             hsi: Some(Hsi {
                 sys_div: HsiSysDiv::DIV4,
@@ -68,11 +72,19 @@ impl Default for Config {
             }),
             hse: None,
             sys: Sysclk::HSISYS,
+            #[cfg(crs)]
+            hsi48: Some(crate::rcc::Hsi48Config::new()),
             ahb_pre: AHBPrescaler::DIV1,
             apb1_pre: APBPrescaler::DIV1,
-            ls: Default::default(),
-            mux: Default::default(),
+            ls: crate::rcc::LsConfig::new(),
+            mux: super::mux::ClockMux::default(),
         }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Config {
+        Self::new()
     }
 }
 
@@ -110,8 +122,8 @@ pub(crate) unsafe fn init(config: Config) {
         }
         Some(hse) => {
             match hse.mode {
-                HseMode::Bypass => assert!(max::HSE_BYP.contains(&hse.freq)),
-                HseMode::Oscillator => assert!(max::HSE_OSC.contains(&hse.freq)),
+                HseMode::Bypass => rcc_assert!(max::HSE_BYP.contains(&hse.freq)),
+                HseMode::Oscillator => rcc_assert!(max::HSE_OSC.contains(&hse.freq)),
             }
 
             RCC.cr().modify(|w| w.set_hsebyp(hse.mode != HseMode::Oscillator));
@@ -121,20 +133,31 @@ pub(crate) unsafe fn init(config: Config) {
         }
     };
 
+    // Configure HSI48 if required
+    #[cfg(crs)]
+    let hsi48 = config.hsi48.map(super::init_hsi48);
+
+    let rtc = config.ls.init();
+
     let sys = match config.sys {
         Sysclk::HSISYS => unwrap!(hsisys),
         Sysclk::HSE => unwrap!(hse),
+        Sysclk::LSI => {
+            assert!(config.ls.lsi);
+            LSI_FREQ
+        }
+        Sysclk::LSE => unwrap!(config.ls.lse).frequency,
         _ => unreachable!(),
     };
 
-    assert!(max::SYSCLK.contains(&sys));
+    rcc_assert!(max::SYSCLK.contains(&sys));
 
     // Calculate the AHB frequency (HCLK), among other things so we can calculate the correct flash read latency.
     let hclk = sys / config.ahb_pre;
-    assert!(max::HCLK.contains(&hclk));
+    rcc_assert!(max::HCLK.contains(&hclk));
 
     let (pclk1, pclk1_tim) = super::util::calc_pclk(hclk, config.apb1_pre);
-    assert!(max::PCLK.contains(&pclk1));
+    rcc_assert!(max::PCLK.contains(&pclk1));
 
     let latency = match hclk.0 {
         ..=24_000_000 => Latency::WS0,
@@ -162,7 +185,11 @@ pub(crate) unsafe fn init(config: Config) {
         RCC.cr().modify(|w| w.set_hsion(false));
     }
 
-    let rtc = config.ls.init();
+    // Disable the HSI48, if not used
+    #[cfg(crs)]
+    if config.hsi48.is_none() {
+        super::disable_hsi48();
+    }
 
     config.mux.init();
 
@@ -174,12 +201,17 @@ pub(crate) unsafe fn init(config: Config) {
         hsi: hsi,
         hsiker: hsiker,
         hse: hse,
+        #[cfg(crs)]
+        hsi48: hsi48,
         rtc: rtc,
 
         // TODO
         lsi: None,
         lse: None,
     );
+
+    RCC.ccipr()
+        .modify(|w| w.set_adc1sel(stm32_metapac::rcc::vals::Adcsel::SYS));
 }
 
 mod max {

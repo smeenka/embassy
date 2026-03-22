@@ -6,15 +6,15 @@ use core::future::poll_fn;
 use core::marker::PhantomData;
 use core::task::Poll;
 
-use embassy_hal_internal::{into_ref, PeripheralRef};
+use embassy_hal_internal::PeripheralType;
 use embassy_sync::waitqueue::AtomicWaker;
 use stm32_metapac::ltdc::regs::Dccr;
 use stm32_metapac::ltdc::vals::{Bf1, Bf2, Cfuif, Clif, Crrif, Cterrif, Pf, Vbr};
 
-use crate::gpio::{AfType, OutputType, Speed};
+use crate::gpio::{AfType, Flex, OutputType, Speed};
 use crate::interrupt::typelevel::Interrupt;
 use crate::interrupt::{self};
-use crate::{peripherals, rcc, Peripheral};
+use crate::{Peri, peripherals, rcc};
 
 static LTDC_WAKER: AtomicWaker = AtomicWaker::new();
 
@@ -83,7 +83,8 @@ pub enum PolarityActive {
 
 /// LTDC driver.
 pub struct Ltdc<'d, T: Instance> {
-    _peri: PeripheralRef<'d, T>,
+    _peri: Peri<'d, T>,
+    _pins: Option<[Flex<'d>; 27]>,
 }
 
 /// LTDC interrupt handler.
@@ -125,6 +126,7 @@ pub struct LtdcLayerConfig {
 #[repr(u8)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg(not(ltdc_v1_3))]
 pub enum PixelFormat {
     /// ARGB8888
     ARGB8888 = Pf::ARGB8888 as u8,
@@ -143,15 +145,46 @@ pub enum PixelFormat {
     /// AL88 (8-bit alpha, 8-bit luminance)
     AL88 = Pf::AL88 as u8,
 }
+/// Pixel format
+#[repr(u8)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg(ltdc_v1_3)]
+pub enum PixelFormat {
+    /// ARGB8888
+    ARGB8888 = Pf::ARGB8888 as u8,
+    /// ABGR8888
+    ABGR8888 = Pf::ABGR8888 as u8,
+    /// RGBA8888
+    RGBA8888 = Pf::RGBA8888 as u8,
+    /// BGRA8888
+    BGRA8888 = Pf::BGRA8888 as u8,
+    /// RGB565
+    RGB565 = Pf::RGB565 as u8,
+    /// BGR565
+    BGR565 = Pf::BGR565 as u8,
+    /// RGB888
+    RGB888 = Pf::RGB888 as u8,
+    /// Flexible
+    FLEXIBLE = Pf::FLEXIBLE as u8,
+}
 
 impl PixelFormat {
     /// Number of bytes per pixel
     pub fn bytes_per_pixel(&self) -> usize {
+        #[cfg(not(ltdc_v1_3))]
         match self {
             PixelFormat::ARGB8888 => 4,
             PixelFormat::RGB888 => 3,
             PixelFormat::RGB565 | PixelFormat::ARGB4444 | PixelFormat::ARGB1555 | PixelFormat::AL88 => 2,
             PixelFormat::AL44 | PixelFormat::L8 => 1,
+        }
+        #[cfg(ltdc_v1_3)]
+        match self {
+            PixelFormat::ARGB8888 | PixelFormat::ABGR8888 | PixelFormat::RGBA8888 | PixelFormat::BGRA8888 => 4,
+            PixelFormat::RGB888 => 3,
+            PixelFormat::RGB565 | PixelFormat::BGR565 => 2,
+            PixelFormat::FLEXIBLE => todo!("Flexable pixels are not yet implemented"),
         }
     }
 }
@@ -178,76 +211,82 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
 impl<'d, T: Instance> Ltdc<'d, T> {
     // Create a new LTDC driver without specifying color and control pins. This is typically used if you want to drive a display though a DsiHost
     /// Note: Full-Duplex modes are not supported at this time
-    pub fn new(peri: impl Peripheral<P = T> + 'd) -> Self {
+    pub fn new(peri: Peri<'d, T>) -> Self {
         Self::setup_clocks();
-        into_ref!(peri);
-        Self { _peri: peri }
+        Self {
+            _peri: peri,
+            _pins: None,
+        }
     }
 
     /// Create a new LTDC driver. 8 pins per color channel for blue, green and red
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_pins(
-        peri: impl Peripheral<P = T> + 'd,
+        peri: Peri<'d, T>,
         _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
-        clk: impl Peripheral<P = impl ClkPin<T>> + 'd,
-        hsync: impl Peripheral<P = impl HsyncPin<T>> + 'd,
-        vsync: impl Peripheral<P = impl VsyncPin<T>> + 'd,
-        b0: impl Peripheral<P = impl B0Pin<T>> + 'd,
-        b1: impl Peripheral<P = impl B1Pin<T>> + 'd,
-        b2: impl Peripheral<P = impl B2Pin<T>> + 'd,
-        b3: impl Peripheral<P = impl B3Pin<T>> + 'd,
-        b4: impl Peripheral<P = impl B4Pin<T>> + 'd,
-        b5: impl Peripheral<P = impl B5Pin<T>> + 'd,
-        b6: impl Peripheral<P = impl B6Pin<T>> + 'd,
-        b7: impl Peripheral<P = impl B7Pin<T>> + 'd,
-        g0: impl Peripheral<P = impl G0Pin<T>> + 'd,
-        g1: impl Peripheral<P = impl G1Pin<T>> + 'd,
-        g2: impl Peripheral<P = impl G2Pin<T>> + 'd,
-        g3: impl Peripheral<P = impl G3Pin<T>> + 'd,
-        g4: impl Peripheral<P = impl G4Pin<T>> + 'd,
-        g5: impl Peripheral<P = impl G5Pin<T>> + 'd,
-        g6: impl Peripheral<P = impl G6Pin<T>> + 'd,
-        g7: impl Peripheral<P = impl G7Pin<T>> + 'd,
-        r0: impl Peripheral<P = impl R0Pin<T>> + 'd,
-        r1: impl Peripheral<P = impl R1Pin<T>> + 'd,
-        r2: impl Peripheral<P = impl R2Pin<T>> + 'd,
-        r3: impl Peripheral<P = impl R3Pin<T>> + 'd,
-        r4: impl Peripheral<P = impl R4Pin<T>> + 'd,
-        r5: impl Peripheral<P = impl R5Pin<T>> + 'd,
-        r6: impl Peripheral<P = impl R6Pin<T>> + 'd,
-        r7: impl Peripheral<P = impl R7Pin<T>> + 'd,
+        clk: Peri<'d, impl ClkPin<T>>,
+        hsync: Peri<'d, impl HsyncPin<T>>,
+        vsync: Peri<'d, impl VsyncPin<T>>,
+        b0: Peri<'d, impl B0Pin<T>>,
+        b1: Peri<'d, impl B1Pin<T>>,
+        b2: Peri<'d, impl B2Pin<T>>,
+        b3: Peri<'d, impl B3Pin<T>>,
+        b4: Peri<'d, impl B4Pin<T>>,
+        b5: Peri<'d, impl B5Pin<T>>,
+        b6: Peri<'d, impl B6Pin<T>>,
+        b7: Peri<'d, impl B7Pin<T>>,
+        g0: Peri<'d, impl G0Pin<T>>,
+        g1: Peri<'d, impl G1Pin<T>>,
+        g2: Peri<'d, impl G2Pin<T>>,
+        g3: Peri<'d, impl G3Pin<T>>,
+        g4: Peri<'d, impl G4Pin<T>>,
+        g5: Peri<'d, impl G5Pin<T>>,
+        g6: Peri<'d, impl G6Pin<T>>,
+        g7: Peri<'d, impl G7Pin<T>>,
+        r0: Peri<'d, impl R0Pin<T>>,
+        r1: Peri<'d, impl R1Pin<T>>,
+        r2: Peri<'d, impl R2Pin<T>>,
+        r3: Peri<'d, impl R3Pin<T>>,
+        r4: Peri<'d, impl R4Pin<T>>,
+        r5: Peri<'d, impl R5Pin<T>>,
+        r6: Peri<'d, impl R6Pin<T>>,
+        r7: Peri<'d, impl R7Pin<T>>,
     ) -> Self {
         Self::setup_clocks();
-        into_ref!(peri);
-        new_pin!(clk, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(hsync, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(vsync, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(b0, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(b1, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(b2, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(b3, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(b4, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(b5, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(b6, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(b7, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(g0, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(g1, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(g2, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(g3, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(g4, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(g5, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(g6, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(g7, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(r0, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(r1, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(r2, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(r3, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(r4, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(r5, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(r6, AfType::output(OutputType::PushPull, Speed::VeryHigh));
-        new_pin!(r7, AfType::output(OutputType::PushPull, Speed::VeryHigh));
+        let pins = [
+            new_pin!(clk, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(hsync, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(vsync, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(b0, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(b1, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(b2, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(b3, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(b4, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(b5, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(b6, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(b7, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(g0, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(g1, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(g2, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(g3, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(g4, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(g5, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(g6, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(g7, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(r0, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(r1, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(r2, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(r3, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(r4, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(r5, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(r6, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+            new_pin!(r7, AfType::output(OutputType::PushPull, Speed::VeryHigh)).unwrap(),
+        ];
 
-        Self { _peri: peri }
+        Self {
+            _peri: peri,
+            _pins: Some(pins),
+        }
     }
 
     /// Initialise and enable the display
@@ -261,23 +300,23 @@ impl<'d, T: Instance> Ltdc<'d, T> {
         // configure the HS, VS, DE and PC polarity
         ltdc.gcr().modify(|w| {
             w.set_hspol(match config.h_sync_polarity {
-                PolarityActive::ActiveHigh => Hspol::ACTIVEHIGH,
-                PolarityActive::ActiveLow => Hspol::ACTIVELOW,
+                PolarityActive::ActiveHigh => Hspol::ACTIVE_HIGH,
+                PolarityActive::ActiveLow => Hspol::ACTIVE_LOW,
             });
 
             w.set_vspol(match config.v_sync_polarity {
-                PolarityActive::ActiveHigh => Vspol::ACTIVEHIGH,
-                PolarityActive::ActiveLow => Vspol::ACTIVELOW,
+                PolarityActive::ActiveHigh => Vspol::ACTIVE_HIGH,
+                PolarityActive::ActiveLow => Vspol::ACTIVE_LOW,
             });
 
             w.set_depol(match config.data_enable_polarity {
-                PolarityActive::ActiveHigh => Depol::ACTIVEHIGH,
-                PolarityActive::ActiveLow => Depol::ACTIVELOW,
+                PolarityActive::ActiveHigh => Depol::ACTIVE_HIGH,
+                PolarityActive::ActiveLow => Depol::ACTIVE_LOW,
             });
 
             w.set_pcpol(match config.pixel_clock_polarity {
-                PolarityEdge::RisingEdge => Pcpol::RISINGEDGE,
-                PolarityEdge::FallingEdge => Pcpol::FALLINGEDGE,
+                PolarityEdge::RisingEdge => Pcpol::RISING_EDGE,
+                PolarityEdge::FallingEdge => Pcpol::FALLING_EDGE,
             });
         });
 
@@ -395,7 +434,10 @@ impl<'d, T: Instance> Ltdc<'d, T> {
         // framebuffer pitch and line length
         layer.cfblr().modify(|w| {
             w.set_cfbp(width * bytes_per_pixel);
+            #[cfg(not(any(stm32u5, stm32f7)))]
             w.set_cfbll(width * bytes_per_pixel + 7);
+            #[cfg(any(stm32u5, stm32f7))]
+            w.set_cfbll(width * bytes_per_pixel + 3);
         });
 
         // framebuffer line number
@@ -526,7 +568,7 @@ trait SealedInstance: crate::rcc::SealedRccPeripheral {
 
 /// LTDC instance trait.
 #[allow(private_bounds)]
-pub trait Instance: SealedInstance + Peripheral<P = Self> + crate::rcc::RccPeripheral + 'static + Send {
+pub trait Instance: SealedInstance + PeripheralType + crate::rcc::RccPeripheral + 'static + Send {
     /// Interrupt for this LTDC instance.
     type Interrupt: interrupt::typelevel::Interrupt;
 }
@@ -561,7 +603,7 @@ pin_trait!(B6Pin, Instance);
 pin_trait!(B7Pin, Instance);
 
 foreach_interrupt!(
-    ($inst:ident, ltdc, LTDC, GLOBAL, $irq:ident) => {
+    ($inst:ident, ltdc, LTDC, LO, $irq:ident) => {
         impl Instance for peripherals::$inst {
             type Interrupt = crate::interrupt::typelevel::$irq;
         }

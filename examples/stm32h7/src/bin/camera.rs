@@ -5,9 +5,8 @@ use embassy_executor::Spawner;
 use embassy_stm32::dcmi::{self, *};
 use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::i2c::I2c;
-use embassy_stm32::rcc::{Mco, Mco1Source, McoPrescaler};
-use embassy_stm32::time::khz;
-use embassy_stm32::{bind_interrupts, i2c, peripherals, Config};
+use embassy_stm32::rcc::{Mco, Mco1Source, McoConfig, McoPrescaler};
+use embassy_stm32::{Config, bind_interrupts, dma, i2c, peripherals};
 use embassy_time::Timer;
 use ov7725::*;
 use {defmt_rtt as _, panic_probe as _};
@@ -21,6 +20,9 @@ bind_interrupts!(struct Irqs {
     I2C1_EV => i2c::EventInterruptHandler<peripherals::I2C1>;
     I2C1_ER => i2c::ErrorInterruptHandler<peripherals::I2C1>;
     DCMI => dcmi::InterruptHandler<peripherals::DCMI>;
+    DMA1_STREAM0 => dma::InterruptHandler<peripherals::DMA1_CH0>;
+    DMA1_STREAM1 => dma::InterruptHandler<peripherals::DMA1_CH1>;
+    DMA1_STREAM2 => dma::InterruptHandler<peripherals::DMA1_CH2>;
 });
 
 #[embassy_executor::main]
@@ -34,6 +36,7 @@ async fn main(_spawner: Spawner) {
             source: PllSource::HSI,
             prediv: PllPreDiv::DIV4,
             mul: PllMul::MUL50,
+            fracn: None,
             divp: Some(PllDiv::DIV2),
             divq: Some(PllDiv::DIV8), // 100mhz
             divr: None,
@@ -49,19 +52,17 @@ async fn main(_spawner: Spawner) {
     let p = embassy_stm32::init(config);
 
     defmt::info!("Hello World!");
-    let mco = Mco::new(p.MCO1, p.PA8, Mco1Source::HSI, McoPrescaler::DIV3);
+
+    let mco_config = {
+        let mut config = McoConfig::default();
+        config.prescaler = McoPrescaler::DIV3;
+        config
+    };
+
+    let mco = Mco::new(p.MCO1, p.PA8, Mco1Source::HSI, mco_config);
 
     let mut led = Output::new(p.PE3, Level::High, Speed::Low);
-    let cam_i2c = I2c::new(
-        p.I2C1,
-        p.PB8,
-        p.PB9,
-        Irqs,
-        p.DMA1_CH1,
-        p.DMA1_CH2,
-        khz(100),
-        Default::default(),
-    );
+    let cam_i2c = I2c::new(p.I2C1, p.PB8, p.PB9, p.DMA1_CH1, p.DMA1_CH2, Irqs, Default::default());
 
     let mut camera = Ov7725::new(cam_i2c, mco);
 

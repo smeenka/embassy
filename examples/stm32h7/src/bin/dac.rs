@@ -3,9 +3,8 @@
 
 use cortex_m_rt::entry;
 use defmt::*;
-use embassy_stm32::dac::{DacCh1, Value};
-use embassy_stm32::dma::NoDma;
 use embassy_stm32::Config;
+use embassy_stm32::dac::{DacChannel, Value};
 use {defmt_rtt as _, panic_probe as _};
 
 #[entry]
@@ -21,6 +20,7 @@ fn main() -> ! {
             source: PllSource::HSI,
             prediv: PllPreDiv::DIV4,
             mul: PllMul::MUL50,
+            fracn: None,
             divp: Some(PllDiv::DIV2),
             divq: Some(PllDiv::DIV8), // 100mhz
             divr: None,
@@ -29,6 +29,7 @@ fn main() -> ! {
             source: PllSource::HSI,
             prediv: PllPreDiv::DIV4,
             mul: PllMul::MUL50,
+            fracn: None,
             divp: Some(PllDiv::DIV8), // 100mhz
             divq: None,
             divr: None,
@@ -44,7 +45,7 @@ fn main() -> ! {
     }
     let p = embassy_stm32::init(config);
 
-    let mut dac = DacCh1::new(p.DAC1, NoDma, p.PA4);
+    let mut dac = DacChannel::new_blocking(p.DAC1, p.PA4);
 
     loop {
         for v in 0..=255 {

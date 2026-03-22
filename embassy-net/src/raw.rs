@@ -1,14 +1,13 @@
 //! Raw sockets.
 
-use core::future::poll_fn;
+use core::future::{Future, poll_fn};
 use core::mem;
 use core::task::{Context, Poll};
 
-use embassy_net_driver::Driver;
 use smoltcp::iface::{Interface, SocketHandle};
 use smoltcp::socket::raw;
 pub use smoltcp::socket::raw::PacketMetadata;
-use smoltcp::wire::{IpProtocol, IpVersion};
+pub use smoltcp::wire::{IpProtocol, IpVersion};
 
 use crate::Stack;
 
@@ -28,10 +27,10 @@ pub struct RawSocket<'a> {
 
 impl<'a> RawSocket<'a> {
     /// Create a new Raw socket using the provided stack and buffers.
-    pub fn new<D: Driver>(
+    pub fn new(
         stack: Stack<'a>,
-        ip_version: IpVersion,
-        ip_protocol: IpProtocol,
+        ip_version: Option<IpVersion>,
+        ip_protocol: Option<IpProtocol>,
         rx_meta: &'a mut [PacketMetadata],
         rx_buffer: &'a mut [u8],
         tx_meta: &'a mut [PacketMetadata],
@@ -62,11 +61,37 @@ impl<'a> RawSocket<'a> {
         })
     }
 
+    /// Wait until the socket becomes readable.
+    ///
+    /// A socket is readable when a packet has been received, or when there are queued packets in
+    /// the buffer.
+    pub fn wait_recv_ready(&self) -> impl Future<Output = ()> + '_ {
+        poll_fn(move |cx| self.poll_recv_ready(cx))
+    }
+
     /// Receive a datagram.
     ///
     /// This method will wait until a datagram is received.
     pub async fn recv(&self, buf: &mut [u8]) -> Result<usize, RecvError> {
         poll_fn(move |cx| self.poll_recv(buf, cx)).await
+    }
+
+    /// Wait until a datagram can be read.
+    ///
+    /// When no datagram is readable, this method will return `Poll::Pending` and
+    /// register the current task to be notified when a datagram is received.
+    ///
+    /// When a datagram is received, this method will return `Poll::Ready`.
+    pub fn poll_recv_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.with_mut(|s, _| {
+            if s.can_recv() {
+                Poll::Ready(())
+            } else {
+                // socket buffer is empty wait until at least one byte has arrived
+                s.register_recv_waker(cx.waker());
+                Poll::Pending
+            }
+        })
     }
 
     /// Receive a datagram.
@@ -85,11 +110,38 @@ impl<'a> RawSocket<'a> {
         })
     }
 
+    /// Wait until the socket becomes writable.
+    ///
+    /// A socket becomes writable when there is space in the buffer, from initial memory or after
+    /// dispatching datagrams on a full buffer.
+    pub fn wait_send_ready(&self) -> impl Future<Output = ()> + '_ {
+        poll_fn(move |cx| self.poll_send_ready(cx))
+    }
+
+    /// Wait until a datagram can be sent.
+    ///
+    /// When no datagram can be sent (i.e. the buffer is full), this method will return
+    /// `Poll::Pending` and register the current task to be notified when
+    /// space is freed in the buffer after a datagram has been dispatched.
+    ///
+    /// When a datagram can be sent, this method will return `Poll::Ready`.
+    pub fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.with_mut(|s, _| {
+            if s.can_send() {
+                Poll::Ready(())
+            } else {
+                // socket buffer is full wait until a datagram has been dispatched
+                s.register_send_waker(cx.waker());
+                Poll::Pending
+            }
+        })
+    }
+
     /// Send a datagram.
     ///
     /// This method will wait until the datagram has been sent.`
-    pub async fn send(&self, buf: &[u8]) {
-        poll_fn(move |cx| self.poll_send(buf, cx)).await
+    pub fn send<'s>(&'s self, buf: &'s [u8]) -> impl Future<Output = ()> + 's {
+        poll_fn(|cx| self.poll_send(buf, cx))
     }
 
     /// Send a datagram.
@@ -106,6 +158,22 @@ impl<'a> RawSocket<'a> {
                 s.register_send_waker(cx.waker());
                 Poll::Pending
             }
+        })
+    }
+
+    /// Flush the socket.
+    ///
+    /// This method will wait until the socket is flushed.
+    pub fn flush(&mut self) -> impl Future<Output = ()> + '_ {
+        poll_fn(|cx| {
+            self.with_mut(|s, _| {
+                if s.send_queue() == 0 {
+                    Poll::Ready(())
+                } else {
+                    s.register_send_waker(cx.waker());
+                    Poll::Pending
+                }
+            })
         })
     }
 }

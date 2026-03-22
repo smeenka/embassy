@@ -1,15 +1,13 @@
 #![no_std]
 #![no_main]
 
-use core::mem;
-
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_net::tcp::TcpSocket;
 use embassy_net::StackResources;
+use embassy_net::tcp::TcpSocket;
 use embassy_nrf::rng::Rng;
-use embassy_nrf::usb::vbus_detect::HardwareVbusDetect;
 use embassy_nrf::usb::Driver;
+use embassy_nrf::usb::vbus_detect::HardwareVbusDetect;
 use embassy_nrf::{bind_interrupts, pac, peripherals, rng, usb};
 use embassy_usb::class::cdc_ncm::embassy_net::{Device, Runner, State as NetState};
 use embassy_usb::class::cdc_ncm::{CdcNcmClass, State};
@@ -20,11 +18,11 @@ use {defmt_rtt as _, panic_probe as _};
 
 bind_interrupts!(struct Irqs {
     USBD => usb::InterruptHandler<peripherals::USBD>;
-    POWER_CLOCK => usb::vbus_detect::InterruptHandler;
+    CLOCK_POWER => usb::vbus_detect::InterruptHandler;
     RNG => rng::InterruptHandler<peripherals::RNG>;
 });
 
-type MyDriver = Driver<'static, peripherals::USBD, HardwareVbusDetect>;
+type MyDriver = Driver<'static, HardwareVbusDetect>;
 
 const MTU: usize = 1514;
 
@@ -46,11 +44,10 @@ async fn net_task(mut runner: embassy_net::Runner<'static, Device<'static, MTU>>
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_nrf::init(Default::default());
-    let clock: pac::CLOCK = unsafe { mem::transmute(()) };
 
     info!("Enabling ext hfosc...");
-    clock.tasks_hfclkstart.write(|w| unsafe { w.bits(1) });
-    while clock.events_hfclkstarted.read().bits() != 1 {}
+    pac::CLOCK.tasks_hfclkstart().write_value(1);
+    while pac::CLOCK.events_hfclkstarted().read() != 1 {}
 
     // Create the driver, from the HAL.
     let driver = Driver::new(p.USBD, Irqs, HardwareVbusDetect::new(Irqs));
@@ -62,12 +59,6 @@ async fn main(spawner: Spawner) {
     config.serial_number = Some("12345678");
     config.max_power = 100;
     config.max_packet_size_0 = 64;
-
-    // Required for Windows support.
-    config.composite_with_iads = true;
-    config.device_class = 0xEF;
-    config.device_sub_class = 0x02;
-    config.device_protocol = 0x01;
 
     // Create embassy-usb DeviceBuilder using the driver and config.
     static CONFIG_DESC: StaticCell<[u8; 256]> = StaticCell::new();
@@ -95,11 +86,11 @@ async fn main(spawner: Spawner) {
     // Build the builder.
     let usb = builder.build();
 
-    unwrap!(spawner.spawn(usb_task(usb)));
+    spawner.spawn(unwrap!(usb_task(usb)));
 
     static NET_STATE: StaticCell<NetState<MTU, 4, 4>> = StaticCell::new();
     let (runner, device) = class.into_embassy_net_device::<MTU, 4, 4>(NET_STATE.init(NetState::new()), our_mac_addr);
-    unwrap!(spawner.spawn(usb_ncm_task(runner)));
+    spawner.spawn(unwrap!(usb_ncm_task(runner)));
 
     let config = embassy_net::Config::dhcpv4(Default::default());
     // let config = embassy_net::Config::ipv4_static(embassy_net::StaticConfigV4 {
@@ -118,7 +109,7 @@ async fn main(spawner: Spawner) {
     static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
     let (stack, runner) = embassy_net::new(device, config, RESOURCES.init(StackResources::new()), seed);
 
-    unwrap!(spawner.spawn(net_task(runner)));
+    spawner.spawn(unwrap!(net_task(runner)));
 
     // And now we can use it!
 

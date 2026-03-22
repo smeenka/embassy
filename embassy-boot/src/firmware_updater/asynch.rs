@@ -6,7 +6,7 @@ use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embedded_storage_async::nor_flash::NorFlash;
 
 use super::FirmwareUpdaterConfig;
-use crate::{FirmwareUpdaterError, State, BOOT_MAGIC, DFU_DETACH_MAGIC, STATE_ERASE_VALUE, SWAP_MAGIC};
+use crate::{BOOT_MAGIC, DFU_DETACH_MAGIC, FirmwareUpdaterError, STATE_ERASE_VALUE, SWAP_MAGIC, State};
 
 /// FirmwareUpdater is an application API for interacting with the BootLoader without the ability to
 /// 'mess up' the internal bootloader state
@@ -25,7 +25,7 @@ impl<'a, DFU: NorFlash, STATE: NorFlash>
         dfu_flash: &'a embassy_sync::mutex::Mutex<NoopRawMutex, DFU>,
         state_flash: &'a embassy_sync::mutex::Mutex<NoopRawMutex, STATE>,
     ) -> Self {
-        extern "C" {
+        unsafe extern "C" {
             static __bootloader_state_start: u32;
             static __bootloader_state_end: u32;
             static __bootloader_dfu_start: u32;
@@ -158,6 +158,17 @@ impl<'d, DFU: NorFlash, STATE: NorFlash> FirmwareUpdater<'d, DFU, STATE> {
             digest.update(&chunk_buf[..len]);
         }
         output.copy_from_slice(digest.finalize().as_slice());
+        Ok(())
+    }
+
+    /// Read a slice of data from the DFU storage peripheral, starting the read
+    /// operation at the given address offset, and reading `buf.len()` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the arguments are not aligned or out of bounds.
+    pub async fn read_dfu(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), FirmwareUpdaterError> {
+        self.dfu.read(offset, buf).await?;
         Ok(())
     }
 
@@ -304,7 +315,7 @@ impl<'d, STATE: NorFlash> FirmwareState<'d, STATE> {
     /// `mark_booted`.
     pub async fn get_state(&mut self) -> Result<State, FirmwareUpdaterError> {
         self.state.read(0, &mut self.aligned).await?;
-        Ok(State::from(&self.aligned))
+        Ok(State::from(&self.aligned[..STATE::WRITE_SIZE]))
     }
 
     /// Mark to trigger firmware swap on next boot.

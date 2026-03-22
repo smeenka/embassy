@@ -1,6 +1,11 @@
 use core::ops::RangeInclusive;
 
+#[cfg(stm32h7rs)]
+use stm32_metapac::rcc::vals::Xspisel;
+
 use crate::pac;
+#[cfg(stm32h7rs)]
+pub use crate::pac::rcc::vals::Plldivst as PllDivSt;
 pub use crate::pac::rcc::vals::{
     Hsidiv as HSIPrescaler, Plldiv as PllDiv, Pllm as PllPreDiv, Plln as PllMul, Pllsrc as PllSource, Sw as Sysclk,
 };
@@ -69,6 +74,10 @@ pub struct Pll {
     /// PLL multiplication factor.
     pub mul: PllMul,
 
+    #[cfg(any(stm32h743))]
+    /// PLL Fractional multiplier.
+    pub fracn: Option<u16>,
+
     /// PLL P division factor. If None, PLL P output is disabled.
     /// On PLL1, it must be even for most series (in particular,
     /// it cannot be 1 in series other than stm32h7, stm32h7rs23/733,
@@ -78,6 +87,12 @@ pub struct Pll {
     pub divq: Option<PllDiv>,
     /// PLL R division factor. If None, PLL R output is disabled.
     pub divr: Option<PllDiv>,
+    #[cfg(stm32h7rs)]
+    /// PLL S division factor. If None, PLL S output is disabled.
+    pub divs: Option<PllDivSt>,
+    #[cfg(stm32h7rs)]
+    /// PLL T division factor. If None, PLL T output is disabled.
+    pub divt: Option<PllDivSt>,
 }
 
 fn apb_div_tim(apb: &APBPrescaler, clk: Hertz, tim: TimerPrescaler) -> Hertz {
@@ -113,8 +128,8 @@ pub enum TimerPrescaler {
 impl From<TimerPrescaler> for Timpre {
     fn from(value: TimerPrescaler) -> Self {
         match value {
-            TimerPrescaler::DefaultX2 => Timpre::DEFAULTX2,
-            TimerPrescaler::DefaultX4 => Timpre::DEFAULTX4,
+            TimerPrescaler::DefaultX2 => Timpre::DEFAULT_X2,
+            TimerPrescaler::DefaultX4 => Timpre::DEFAULT_X4,
         }
     }
 }
@@ -218,13 +233,13 @@ pub struct Config {
     pub mux: super::mux::ClockMux,
 }
 
-impl Default for Config {
-    fn default() -> Self {
+impl Config {
+    pub const fn new() -> Self {
         Self {
             hsi: Some(HSIPrescaler::DIV1),
             hse: None,
             csi: false,
-            hsi48: Some(Default::default()),
+            hsi48: Some(crate::rcc::Hsi48Config::new()),
             sys: Sysclk::HSI,
             pll1: None,
             pll2: None,
@@ -248,13 +263,19 @@ impl Default for Config {
             voltage_scale: VoltageScale::Scale0,
             #[cfg(rcc_h7rs)]
             voltage_scale: VoltageScale::HIGH,
-            ls: Default::default(),
+            ls: crate::rcc::LsConfig::new(),
 
             #[cfg(any(pwr_h7rm0399, pwr_h7rm0455, pwr_h7rm0468, pwr_h7rs))]
             supply_config: SupplyConfig::LDO,
 
-            mux: Default::default(),
+            mux: super::mux::ClockMux::default(),
         }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -415,6 +436,13 @@ pub(crate) unsafe fn init(config: Config) {
     }
     while !RCC.cr().read().hsirdy() {}
 
+    #[cfg(stm32h7rs)]
+    {
+        // Switch the XSPI clock source so it will use HSI
+        RCC.ahbperckselr().modify(|w| w.set_xspi1sel(Xspisel::HCLK5));
+        RCC.ahbperckselr().modify(|w| w.set_xspi2sel(Xspisel::HCLK5));
+    };
+
     // Use the HSI clock as system clock during the actual clock setup
     RCC.cfgr().modify(|w| w.set_sw(Sysclk::HSI));
     while RCC.cfgr().read().sws() != Sysclk::HSI {}
@@ -470,10 +498,28 @@ pub(crate) unsafe fn init(config: Config) {
 
     // Configure PLLs.
     let pll_input = PllInput { csi, hse, hsi };
-    let pll1 = init_pll(0, config.pll1, &pll_input);
-    let pll2 = init_pll(1, config.pll2, &pll_input);
+    let pll1 = config.pll1.map_or_else(
+        || {
+            disable_pll(0);
+            PllOutput::default()
+        },
+        |c| init_pll(0, Some(c), &pll_input),
+    );
+    let pll2 = config.pll2.map_or_else(
+        || {
+            disable_pll(1);
+            PllOutput::default()
+        },
+        |c| init_pll(1, Some(c), &pll_input),
+    );
     #[cfg(any(rcc_h5, stm32h7, stm32h7rs))]
-    let pll3 = init_pll(2, config.pll3, &pll_input);
+    let pll3 = config.pll3.map_or_else(
+        || {
+            disable_pll(2);
+            PllOutput::default()
+        },
+        |c| init_pll(2, Some(c), &pll_input),
+    );
 
     // Configure sysclk
     let sys = match config.sys {
@@ -575,7 +621,10 @@ pub(crate) unsafe fn init(config: Config) {
             Hertz(24_000_000) => Usbrefcksel::MHZ24,
             Hertz(26_000_000) => Usbrefcksel::MHZ26,
             Hertz(32_000_000) => Usbrefcksel::MHZ32,
-            _ => panic!("cannot select USBPHYC reference clock with source frequency of {} Hz, must be one of 16, 19.2, 20, 24, 26, 32 MHz", clk_val),
+            _ => panic!(
+                "cannot select USBPHYC reference clock with source frequency of {}, must be one of 16, 19.2, 20, 24, 26, 32 MHz",
+                clk_val
+            ),
         },
         None => Usbrefcksel::MHZ24,
     };
@@ -646,6 +695,12 @@ pub(crate) unsafe fn init(config: Config) {
         RCC.cr().modify(|w| w.set_hsion(false));
     }
 
+    // Disable the HSI48, if not used
+    #[cfg(crs)]
+    if config.hsi48.is_none() {
+        super::disable_hsi48();
+    }
+
     // IO compensation cell - Requires CSI clock and SYSCFG
     #[cfg(any(stm32h7))] // TODO h5, h7rs
     if csi.is_some() {
@@ -687,7 +742,6 @@ pub(crate) unsafe fn init(config: Config) {
         hsi: hsi,
         hsi48: hsi48,
         csi: csi,
-        csi_div_122: csi.map(|c| c / 122u32),
         hse: hse,
 
         lse: None,
@@ -698,9 +752,9 @@ pub(crate) unsafe fn init(config: Config) {
         pll2_q: pll2.q,
         pll2_r: pll2.r,
         #[cfg(stm32h7rs)]
-        pll2_s: None, // TODO
+        pll2_s: pll2.s,
         #[cfg(stm32h7rs)]
-        pll2_t: None, // TODO
+        pll2_t: pll2.t,
         #[cfg(any(rcc_h5, stm32h7, stm32h7rs))]
         pll3_p: pll3.p,
         #[cfg(any(rcc_h5, stm32h7, stm32h7rs))]
@@ -726,9 +780,9 @@ pub(crate) unsafe fn init(config: Config) {
         #[cfg(stm32h7rs)]
         clk48mohci: None, // TODO
         #[cfg(stm32h7rs)]
-        hse_div_2: hse.map(|clk| clk / 2u32),
-        #[cfg(stm32h7rs)]
         usb: Some(Hertz(48_000_000)),
+        #[cfg(stm32h5)]
+        hse_div_rtcpre: None, // TODO
     );
 }
 
@@ -738,31 +792,38 @@ struct PllInput {
     csi: Option<Hertz>,
 }
 
+#[derive(Default)]
 struct PllOutput {
     p: Option<Hertz>,
     #[allow(dead_code)]
     q: Option<Hertz>,
     #[allow(dead_code)]
     r: Option<Hertz>,
+    #[cfg(stm32h7rs)]
+    #[allow(dead_code)]
+    s: Option<Hertz>,
+    #[cfg(stm32h7rs)]
+    #[allow(dead_code)]
+    t: Option<Hertz>,
+}
+
+fn disable_pll(num: usize) {
+    // Stop PLL
+    RCC.cr().modify(|w| w.set_pllon(num, false));
+    while RCC.cr().read().pllrdy(num) {}
+
+    // "To save power when PLL1 is not used, the value of PLL1M must be set to 0.""
+    #[cfg(any(stm32h7, stm32h7rs))]
+    RCC.pllckselr().write(|w| w.set_divm(num, PllPreDiv::from_bits(0)));
+    #[cfg(stm32h5)]
+    RCC.pllcfgr(num).write(|w| w.set_divm(PllPreDiv::from_bits(0)));
 }
 
 fn init_pll(num: usize, config: Option<Pll>, input: &PllInput) -> PllOutput {
     let Some(config) = config else {
-        // Stop PLL
-        RCC.cr().modify(|w| w.set_pllon(num, false));
-        while RCC.cr().read().pllrdy(num) {}
+        disable_pll(num);
 
-        // "To save power when PLL1 is not used, the value of PLL1M must be set to 0.""
-        #[cfg(any(stm32h7, stm32h7rs))]
-        RCC.pllckselr().write(|w| w.set_divm(num, PllPreDiv::from_bits(0)));
-        #[cfg(stm32h5)]
-        RCC.pllcfgr(num).write(|w| w.set_divm(PllPreDiv::from_bits(0)));
-
-        return PllOutput {
-            p: None,
-            q: None,
-            r: None,
-        };
+        return PllOutput::default();
     };
 
     let in_clk = match config.source {
@@ -779,20 +840,29 @@ fn init_pll(num: usize, config: Option<Pll>, input: &PllInput) -> PllOutput {
         ..=3_999_999 => Pllrge::RANGE2,
         ..=7_999_999 => Pllrge::RANGE4,
         ..=16_000_000 => Pllrge::RANGE8,
-        x => panic!("pll ref_clk out of range: {} mhz", x),
+        x => panic!("pll ref_clk out of range: {} hz", x),
     };
 
     // The smaller range (150 to 420 MHz) must
     // be chosen when the reference clock frequency is lower than 2 MHz.
     let wide_allowed = ref_range != Pllrge::RANGE1;
 
+    #[cfg(stm32h743)]
+    let vco_clk = match config.fracn {
+        Some(fracn) => {
+            Hertz::hz((ref_clk.0 as f32 * ((config.mul.to_bits() + 1) as f32 + (fracn as f32 / 8192.0))) as u32)
+        }
+        None => ref_clk * config.mul,
+    };
+    #[cfg(not(stm32h743))]
     let vco_clk = ref_clk * config.mul;
+
     let vco_range = if VCO_RANGE.contains(&vco_clk) {
-        Pllvcosel::MEDIUMVCO
+        Pllvcosel::MEDIUM_VCO
     } else if wide_allowed && VCO_WIDE_RANGE.contains(&vco_clk) {
-        Pllvcosel::WIDEVCO
+        Pllvcosel::WIDE_VCO
     } else {
-        panic!("pll vco_clk out of range: {} hz", vco_clk.0)
+        panic!("pll vco_clk out of range: {}", vco_clk)
     };
 
     let p = config.divp.map(|div| {
@@ -809,6 +879,10 @@ fn init_pll(num: usize, config: Option<Pll>, input: &PllInput) -> PllOutput {
     });
     let q = config.divq.map(|div| vco_clk / div);
     let r = config.divr.map(|div| vco_clk / div);
+    #[cfg(stm32h7rs)]
+    let s = config.divs.map(|div| vco_clk / div);
+    #[cfg(stm32h7rs)]
+    let t = config.divt.map(|div| vco_clk / div);
 
     #[cfg(stm32h5)]
     RCC.pllcfgr(num).write(|w| {
@@ -828,13 +902,33 @@ fn init_pll(num: usize, config: Option<Pll>, input: &PllInput) -> PllOutput {
             w.set_divm(num, config.prediv);
             w.set_pllsrc(config.source);
         });
+
+        #[cfg(stm32h743)]
+        if let Some(fracn) = config.fracn {
+            RCC.pllfracr(num).modify(|w| w.set_fracn(fracn))
+        }
+
         RCC.pllcfgr().modify(|w| {
             w.set_pllvcosel(num, vco_range);
             w.set_pllrge(num, ref_range);
+
+            #[cfg(stm32h743)]
+            if config.fracn.is_some() {
+                w.set_pllfracen(num, true);
+            } else {
+                w.set_pllfracen(num, false);
+            }
+
+            #[cfg(not(stm32h743))]
             w.set_pllfracen(num, false);
+
             w.set_divpen(num, p.is_some());
             w.set_divqen(num, q.is_some());
             w.set_divren(num, r.is_some());
+            #[cfg(stm32h7rs)]
+            w.set_divsen(num, s.is_some());
+            #[cfg(stm32h7rs)]
+            w.set_divten(num, t.is_some());
         });
     }
 
@@ -845,10 +939,24 @@ fn init_pll(num: usize, config: Option<Pll>, input: &PllInput) -> PllOutput {
         w.set_pllr(config.divr.unwrap_or(PllDiv::DIV2));
     });
 
+    #[cfg(stm32h7rs)]
+    RCC.plldivr2(num).write(|w| {
+        w.set_plls(config.divs.unwrap_or(PllDivSt::DIV2));
+        w.set_pllt(config.divt.unwrap_or(PllDivSt::DIV2));
+    });
+
     RCC.cr().modify(|w| w.set_pllon(num, true));
     while !RCC.cr().read().pllrdy(num) {}
 
-    PllOutput { p, q, r }
+    PllOutput {
+        p,
+        q,
+        r,
+        #[cfg(stm32h7rs)]
+        s,
+        #[cfg(stm32h7rs)]
+        t,
+    }
 }
 
 fn flash_setup(clk: Hertz, vos: VoltageScale) {

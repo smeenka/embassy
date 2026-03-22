@@ -4,10 +4,10 @@
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_stm32::gpio::{AfType, Flex, OutputType, Speed};
-use embassy_stm32::time::{khz, Hertz};
-use embassy_stm32::timer::low_level::{OutputCompareMode, Timer as LLTimer};
-use embassy_stm32::timer::{Channel, Channel1Pin, Channel2Pin, Channel3Pin, Channel4Pin, GeneralInstance32bit4Channel};
-use embassy_stm32::{into_ref, Config, Peripheral};
+use embassy_stm32::time::{Hertz, khz};
+use embassy_stm32::timer::low_level::{OutputCompareMode, RoundTo, Timer as LLTimer};
+use embassy_stm32::timer::{Ch1, Ch2, Ch3, Ch4, Channel, GeneralInstance32bit4Channel, TimerPin};
+use embassy_stm32::{Config, Peri};
 use embassy_time::Timer;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -22,6 +22,7 @@ async fn main(_spawner: Spawner) {
             source: PllSource::HSI,
             prediv: PllPreDiv::DIV4,
             mul: PllMul::MUL50,
+            fracn: None,
             divp: Some(PllDiv::DIV2),
             divq: Some(PllDiv::DIV8), // 100mhz
             divr: None,
@@ -66,15 +67,13 @@ pub struct SimplePwm32<'d, T: GeneralInstance32bit4Channel> {
 
 impl<'d, T: GeneralInstance32bit4Channel> SimplePwm32<'d, T> {
     pub fn new(
-        tim: impl Peripheral<P = T> + 'd,
-        ch1: impl Peripheral<P = impl Channel1Pin<T>> + 'd,
-        ch2: impl Peripheral<P = impl Channel2Pin<T>> + 'd,
-        ch3: impl Peripheral<P = impl Channel3Pin<T>> + 'd,
-        ch4: impl Peripheral<P = impl Channel4Pin<T>> + 'd,
+        tim: Peri<'d, T>,
+        ch1: Peri<'d, impl TimerPin<T, Ch1>>,
+        ch2: Peri<'d, impl TimerPin<T, Ch2>>,
+        ch3: Peri<'d, impl TimerPin<T, Ch3>>,
+        ch4: Peri<'d, impl TimerPin<T, Ch4>>,
         freq: Hertz,
     ) -> Self {
-        into_ref!(ch1, ch2, ch3, ch4);
-
         let af1 = ch1.af_num();
         let af2 = ch2.af_num();
         let af3 = ch3.af_num();
@@ -124,7 +123,7 @@ impl<'d, T: GeneralInstance32bit4Channel> SimplePwm32<'d, T> {
     }
 
     pub fn set_frequency(&mut self, freq: Hertz) {
-        self.tim.set_frequency(freq);
+        self.tim.set_frequency(freq, RoundTo::Slower);
     }
 
     pub fn get_max_duty(&self) -> u32 {

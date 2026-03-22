@@ -5,14 +5,30 @@ use core::future::poll_fn;
 use core::marker::PhantomData;
 use core::task::Poll;
 
-use embassy_hal_internal::{into_ref, PeripheralRef};
+use embassy_hal_internal::PeripheralType;
 use embassy_sync::waitqueue::AtomicWaker;
-use rand_core::{CryptoRng, RngCore};
 
 use crate::interrupt::typelevel::Interrupt;
-use crate::{interrupt, pac, peripherals, rcc, Peripheral};
+use crate::{Peri, interrupt, pac, peripherals, rcc};
 
 static RNG_WAKER: AtomicWaker = AtomicWaker::new();
+
+/// WBA-specific health test configuration values for RNG
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+enum Htcfg {
+    /// WBA-specific health test configuration (0x0000AAC7)
+    /// Corresponds to configuration A, B, and C thresholds as recommended in the reference manual
+    WbaRecommended = 0x0000_AAC7,
+}
+
+impl Htcfg {
+    /// Convert to the raw u32 value for register access
+    #[allow(dead_code)]
+    fn value(self) -> u32 {
+        self as u32
+    }
+}
 
 /// RNG error
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -43,17 +59,20 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
 
 /// RNG driver.
 pub struct Rng<'d, T: Instance> {
-    _inner: PeripheralRef<'d, T>,
+    _inner: Peri<'d, T>,
 }
 
 impl<'d, T: Instance> Rng<'d, T> {
     /// Create a new RNG driver.
     pub fn new(
-        inner: impl Peripheral<P = T> + 'd,
+        inner: Peri<'d, T>,
         _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
     ) -> Self {
         rcc::enable_and_reset::<T>();
-        into_ref!(inner);
+
+        // Verify clock is available
+        T::frequency();
+
         let mut random = Self { _inner: inner };
         random.reset();
 
@@ -88,10 +107,10 @@ impl<'d, T: Instance> Rng<'d, T> {
             reg.set_nistc(pac::rng::vals::Nistc::CUSTOM);
             // set RNG config "A" according to reference manual
             // this has to be written within the same write access as setting the CONDRST bit
-            reg.set_rng_config1(pac::rng::vals::RngConfig1::CONFIGA);
-            reg.set_clkdiv(pac::rng::vals::Clkdiv::NODIV);
-            reg.set_rng_config2(pac::rng::vals::RngConfig2::CONFIGA_B);
-            reg.set_rng_config3(pac::rng::vals::RngConfig3::CONFIGA);
+            reg.set_rng_config1(pac::rng::vals::RngConfig1::CONFIG_A);
+            reg.set_clkdiv(pac::rng::vals::Clkdiv::NO_DIV);
+            reg.set_rng_config2(pac::rng::vals::RngConfig2::CONFIG_A_B);
+            reg.set_rng_config3(pac::rng::vals::RngConfig3::CONFIG_A);
             reg.set_ced(true);
             reg.set_ie(false);
             reg.set_rngen(true);
@@ -101,20 +120,40 @@ impl<'d, T: Instance> Rng<'d, T> {
         });
         // wait for CONDRST to be set
         while !T::regs().cr().read().condrst() {}
-        // magic number must be written immediately before every read or write access to HTCR
-        T::regs().htcr().write(|w| w.set_htcfg(pac::rng::vals::Htcfg::MAGIC));
-        // write recommended value according to reference manual
-        // note: HTCR can only be written during conditioning
-        T::regs()
-            .htcr()
-            .write(|w| w.set_htcfg(pac::rng::vals::Htcfg::RECOMMENDED));
+
+        // Set health test configuration values
+        #[cfg(not(rng_wba6))]
+        {
+            // magic number must be written immediately before every read or write access to HTCR
+            T::regs().htcr().write(|w| w.set_htcfg(pac::rng::vals::Htcfg::MAGIC));
+            // write recommended value according to reference manual
+            // note: HTCR can only be written during conditioning
+            T::regs()
+                .htcr()
+                .write(|w| w.set_htcfg(pac::rng::vals::Htcfg::RECOMMENDED));
+        }
+        #[cfg(rng_wba6)]
+        {
+            // For WBA6, set RNG_HTCR0 to the recommended value for configurations A, B, and C
+            // This value corresponds to the health test thresholds specified in the reference manual
+            T::regs().htcr(0).write(|w| w.0 = Htcfg::WbaRecommended.value());
+        }
+
         // finish conditioning
         T::regs().cr().modify(|reg| {
             reg.set_rngen(true);
             reg.set_condrst(false);
         });
-        // wait for CONDRST to be reset
-        while T::regs().cr().read().condrst() {}
+
+        // According to reference manual for RNGv3: SEIS must be cleared manually.
+        // RNGv2 does not say anything about SEIS clearing, but ST Cube HAL clears it.
+        T::regs().sr().modify(|reg| {
+            reg.set_seis(false);
+        });
+
+        // According to reference manual: after software reset, wait for random number to be ready
+        // The next_u32() call will wait for DRDY, completing the initialization
+        let _ = self.next_u32();
     }
 
     /// Try to recover from a seed error.
@@ -185,10 +224,9 @@ impl<'d, T: Instance> Rng<'d, T> {
 
         Ok(())
     }
-}
 
-impl<'d, T: Instance> RngCore for Rng<'d, T> {
-    fn next_u32(&mut self) -> u32 {
+    /// Get a random u32
+    pub fn next_u32(&mut self) -> u32 {
         loop {
             let sr = T::regs().sr().read();
             if sr.seis() | sr.ceis() {
@@ -199,13 +237,15 @@ impl<'d, T: Instance> RngCore for Rng<'d, T> {
         }
     }
 
-    fn next_u64(&mut self) -> u64 {
+    /// Get a random u64
+    pub fn next_u64(&mut self) -> u64 {
         let mut rand = self.next_u32() as u64;
         rand |= (self.next_u32() as u64) << 32;
         rand
     }
 
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
+    /// Fill a slice with random bytes
+    pub fn fill_bytes(&mut self, dest: &mut [u8]) {
         for chunk in dest.chunks_mut(4) {
             let rand = self.next_u32();
             for (slot, num) in chunk.iter_mut().zip(rand.to_ne_bytes().iter()) {
@@ -213,14 +253,53 @@ impl<'d, T: Instance> RngCore for Rng<'d, T> {
             }
         }
     }
+}
 
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+impl<'d, T: Instance> Drop for Rng<'d, T> {
+    fn drop(&mut self) {
+        T::regs().cr().modify(|reg| {
+            reg.set_rngen(false);
+        });
+        rcc::disable::<T>();
+    }
+}
+
+impl<'d, T: Instance> rand_core_06::RngCore for Rng<'d, T> {
+    fn next_u32(&mut self) -> u32 {
+        self.next_u32()
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.next_u64()
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        self.fill_bytes(dest);
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core_06::Error> {
         self.fill_bytes(dest);
         Ok(())
     }
 }
 
-impl<'d, T: Instance> CryptoRng for Rng<'d, T> {}
+impl<'d, T: Instance> rand_core_06::CryptoRng for Rng<'d, T> {}
+
+impl<'d, T: Instance> rand_core_09::RngCore for Rng<'d, T> {
+    fn next_u32(&mut self) -> u32 {
+        self.next_u32()
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.next_u64()
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        self.fill_bytes(dest);
+    }
+}
+
+impl<'d, T: Instance> rand_core_09::CryptoRng for Rng<'d, T> {}
 
 trait SealedInstance {
     fn regs() -> pac::rng::Rng;
@@ -228,7 +307,7 @@ trait SealedInstance {
 
 /// RNG instance trait.
 #[allow(private_bounds)]
-pub trait Instance: SealedInstance + Peripheral<P = Self> + crate::rcc::RccPeripheral + 'static + Send {
+pub trait Instance: SealedInstance + PeripheralType + crate::rcc::RccPeripheral + 'static + Send {
     /// Interrupt for this RNG instance.
     type Interrupt: interrupt::typelevel::Interrupt;
 }

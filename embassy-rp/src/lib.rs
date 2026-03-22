@@ -1,5 +1,7 @@
 #![no_std]
 #![allow(async_fn_in_trait)]
+#![allow(unsafe_op_in_unsafe_fn)]
+#![allow(unused_unsafe)]
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 
@@ -20,11 +22,16 @@ mod intrinsics;
 
 pub mod adc;
 #[cfg(feature = "_rp235x")]
+pub mod aon_timer;
+#[cfg(feature = "_rp235x")]
 pub mod block;
 #[cfg(feature = "rp2040")]
 pub mod bootsel;
 pub mod clocks;
+pub(crate) mod datetime;
 pub mod dma;
+#[cfg(any(feature = "executor-thread", feature = "executor-interrupt"))]
+pub mod executor;
 pub mod flash;
 #[cfg(feature = "rp2040")]
 mod float;
@@ -35,12 +42,18 @@ pub mod multicore;
 #[cfg(feature = "_rp235x")]
 pub mod otp;
 pub mod pio_programs;
+#[cfg(feature = "_rp235x")]
+pub mod psram;
 pub mod pwm;
+#[cfg(feature = "_rp235x")]
+pub mod qmi_cs1;
 mod reset;
 pub mod rom_data;
 #[cfg(feature = "rp2040")]
 pub mod rtc;
 pub mod spi;
+mod spinlock;
+pub mod spinlock_mutex;
 #[cfg(feature = "time-driver")]
 pub mod time_driver;
 #[cfg(feature = "_rp235x")]
@@ -54,7 +67,7 @@ pub mod pio;
 pub(crate) mod relocate;
 
 // Reexports
-pub use embassy_hal_internal::{into_ref, Peripheral, PeripheralRef};
+pub use embassy_hal_internal::{Peri, PeripheralType};
 #[cfg(feature = "unstable-pac")]
 pub use rp_pac as pac;
 #[cfg(not(feature = "unstable-pac"))]
@@ -139,6 +152,8 @@ embassy_hal_internal::interrupt_mod!(
     TRNG_IRQ,
     PLL_SYS_IRQ,
     PLL_USB_IRQ,
+    POWMAN_IRQ_POW,
+    POWMAN_IRQ_TIMER,
     SWI_IRQ_0,
     SWI_IRQ_1,
     SWI_IRQ_2,
@@ -158,32 +173,56 @@ embassy_hal_internal::interrupt_mod!(
 /// ```rust,ignore
 /// use embassy_rp::{bind_interrupts, usb, peripherals};
 ///
-/// bind_interrupts!(struct Irqs {
-///     USBCTRL_IRQ => usb::InterruptHandler<peripherals::USB>;
-/// });
+/// bind_interrupts!(
+///     /// Binds the USB Interrupts.
+///     struct Irqs {
+///         USBCTRL_IRQ => usb::InterruptHandler<peripherals::USB>;
+///     }
+/// );
 /// ```
 ///
 // developer note: this macro can't be in `embassy-hal-internal` due to the use of `$crate`.
 #[macro_export]
 macro_rules! bind_interrupts {
-    ($vis:vis struct $name:ident { $($irq:ident => $($handler:ty),*;)* }) => {
-            #[derive(Copy, Clone)]
-            $vis struct $name;
+    ($(#[$attr:meta])* $vis:vis struct $name:ident {
+        $(
+            $(#[cfg($cond_irq:meta)])?
+            $irq:ident => $(
+                $(#[cfg($cond_handler:meta)])?
+                $handler:ty
+            ),*;
+        )*
+    }) => {
+        #[derive(Copy, Clone)]
+        $(#[$attr])*
+        $vis struct $name;
 
         $(
             #[allow(non_snake_case)]
-            #[no_mangle]
+            #[unsafe(no_mangle)]
+            $(#[cfg($cond_irq)])?
             unsafe extern "C" fn $irq() {
-                $(
-                    <$handler as $crate::interrupt::typelevel::Handler<$crate::interrupt::typelevel::$irq>>::on_interrupt();
-                )*
+                unsafe {
+                    $(
+                        $(#[cfg($cond_handler)])?
+                        <$handler as $crate::interrupt::typelevel::Handler<$crate::interrupt::typelevel::$irq>>::on_interrupt();
+
+                    )*
+                }
             }
 
-            $(
-                unsafe impl $crate::interrupt::typelevel::Binding<$crate::interrupt::typelevel::$irq, $handler> for $name {}
-            )*
+            $(#[cfg($cond_irq)])?
+            $crate::bind_interrupts!(@inner
+                $(
+                    $(#[cfg($cond_handler)])?
+                    unsafe impl $crate::interrupt::typelevel::Binding<$crate::interrupt::typelevel::$irq, $handler> for $name {}
+                )*
+            );
         )*
     };
+    (@inner $($t:tt)*) => {
+        $($t)*
+    }
 }
 
 #[cfg(feature = "rp2040")]
@@ -355,6 +394,8 @@ embassy_hal_internal::peripherals! {
     SPI0,
     SPI1,
 
+    QMI_CS1,
+
     I2C0,
     I2C1,
 
@@ -406,6 +447,7 @@ embassy_hal_internal::peripherals! {
     WATCHDOG,
     BOOTSEL,
 
+    POWMAN,
     TRNG
 }
 
@@ -414,13 +456,13 @@ macro_rules! select_bootloader {
     ( $( $feature:literal => $loader:ident, )+ default => $default:ident ) => {
         $(
             #[cfg(feature = $feature)]
-            #[link_section = ".boot2"]
+            #[unsafe(link_section = ".boot2")]
             #[used]
             static BOOT2: [u8; 256] = rp2040_boot2::$loader;
         )*
 
         #[cfg(not(any( $( feature = $feature),* )))]
-        #[link_section = ".boot2"]
+        #[unsafe(link_section = ".boot2")]
         #[used]
         static BOOT2: [u8; 256] = rp2040_boot2::$default;
     }
@@ -436,6 +478,30 @@ select_bootloader! {
     "boot2-w25q080" => BOOT_LOADER_W25Q080,
     "boot2-w25x10cl" => BOOT_LOADER_W25X10CL,
     default => BOOT_LOADER_W25Q080
+}
+
+#[cfg(all(not(feature = "imagedef-none"), feature = "_rp235x"))]
+macro_rules! select_imagedef {
+    ( $( $feature:literal => $imagedef:ident, )+ default => $default:ident ) => {
+        $(
+            #[cfg(feature = $feature)]
+            #[unsafe(link_section = ".start_block")]
+            #[used]
+            static IMAGE_DEF: crate::block::ImageDef = crate::block::ImageDef::$imagedef();
+        )*
+
+        #[cfg(not(any( $( feature = $feature),* )))]
+        #[unsafe(link_section = ".start_block")]
+        #[used]
+        static IMAGE_DEF: crate::block::ImageDef = crate::block::ImageDef::$default();
+    }
+}
+
+#[cfg(all(not(feature = "imagedef-none"), feature = "_rp235x"))]
+select_imagedef! {
+    "imagedef-secure-exe" => secure_exe,
+    "imagedef-nonsecure-exe" => non_secure_exe,
+    default => secure_exe
 }
 
 /// Installs a stack guard for the CORE0 stack in MPU region 0.
@@ -472,7 +538,7 @@ select_bootloader! {
 /// }
 /// ```
 pub fn install_core0_stack_guard() -> Result<(), ()> {
-    extern "C" {
+    unsafe extern "C" {
         static mut _stack_end: usize;
     }
     unsafe { install_stack_guard(core::ptr::addr_of_mut!(_stack_end)) }
@@ -509,18 +575,10 @@ unsafe fn install_stack_guard(stack_bottom: *mut usize) -> Result<(), ()> {
 #[cfg(all(feature = "_rp235x", not(feature = "_test")))]
 #[inline(always)]
 unsafe fn install_stack_guard(stack_bottom: *mut usize) -> Result<(), ()> {
-    let core = unsafe { cortex_m::Peripherals::steal() };
+    // The RP2350 arm cores are cortex-m33 and can use the MSPLIM register to guard the end of stack.
+    // We'll need to do something else for the riscv cores.
+    cortex_m::register::msplim::write(stack_bottom.addr() as u32);
 
-    // Fail if MPU is already configured
-    if core.MPU.ctrl.read() != 0 {
-        return Err(());
-    }
-
-    unsafe {
-        core.MPU.ctrl.write(5); // enable mpu with background default map
-        core.MPU.rbar.write(stack_bottom as u32 & !0xff); // set address
-        core.MPU.rlar.write(1); // enable region
-    }
     Ok(())
 }
 
@@ -580,7 +638,7 @@ pub fn init(config: config::Config) -> Peripherals {
     peripherals
 }
 
-#[cfg(all(feature = "rt", feature = "rp2040"))]
+#[cfg(feature = "rt")]
 #[cortex_m_rt::pre_init]
 unsafe fn pre_init() {
     // SIO does not get reset when core0 is reset with either `scb::sys_reset()` or with SWD.
@@ -611,17 +669,52 @@ unsafe fn pre_init() {
     //
     // The PSM order is SIO -> PROC0 -> PROC1.
     // So, we have to force-on PROC0 to prevent it from getting reset when resetting SIO.
-    pac::PSM.frce_on().write_and_wait(|w| {
-        w.set_proc0(true);
-    });
-    // Then reset SIO and PROC1.
-    pac::PSM.frce_off().write_and_wait(|w| {
-        w.set_sio(true);
-        w.set_proc1(true);
-    });
-    // clear force_off first, force_on second. The other way around would reset PROC0.
-    pac::PSM.frce_off().write_and_wait(|_| {});
-    pac::PSM.frce_on().write_and_wait(|_| {});
+    #[cfg(feature = "rp2040")]
+    {
+        pac::PSM.frce_on().write_and_wait(|w| {
+            w.set_proc0(true);
+        });
+        // Then reset SIO and PROC1.
+        pac::PSM.frce_off().write_and_wait(|w| {
+            w.set_sio(true);
+            w.set_proc1(true);
+        });
+        // clear force_off first, force_on second. The other way around would reset PROC0.
+        pac::PSM.frce_off().write_and_wait(|_| {});
+        pac::PSM.frce_on().write_and_wait(|_| {});
+    }
+
+    #[cfg(feature = "_rp235x")]
+    {
+        // on RP235x, datasheet says "The FRCE_ON register is a development feature that does nothing in production devices."
+        // No idea why they removed it. Removing it means we can't use PSM to reset SIO, because it comes before
+        // PROC0, so we'd need FRCE_ON to prevent resetting ourselves.
+        //
+        // So we just unlock the spinlock manually.
+        pac::SIO.spinlock(31).write_value(1);
+
+        // We can still use PSM to reset PROC1 since it comes after PROC0 in the state machine.
+        pac::PSM.frce_off().write_and_wait(|w| w.set_proc1(true));
+        pac::PSM.frce_off().write_and_wait(|_| {});
+
+        // Make atomics work between cores.
+        enable_actlr_extexclall();
+    }
+}
+
+/// Set the EXTEXCLALL bit in ACTLR.
+///
+/// The default MPU memory map marks all memory as non-shareable, so atomics don't
+/// synchronize memory accesses between cores at all. This bit forces all memory to be
+/// considered shareable regardless of what the MPU says.
+///
+/// TODO: does this interfere somehow if the user wants to use a custom MPU configuration?
+/// maybe we need to add a way to disable this?
+///
+/// This must be done FOR EACH CORE.
+#[cfg(feature = "_rp235x")]
+unsafe fn enable_actlr_extexclall() {
+    (&*cortex_m::peripheral::ICB::PTR).actlr.modify(|w| w | (1 << 29));
 }
 
 /// Extension trait for PAC regs, adding atomic xor/bitset/bitclear writes.

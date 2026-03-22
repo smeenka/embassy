@@ -5,6 +5,7 @@ use crate::pac::rcc::regs::Cfgr;
 pub use crate::pac::rcc::vals::Hsepre as HsePrescaler;
 pub use crate::pac::rcc::vals::{Hpre as AHBPrescaler, Msirange as MSIRange, Ppre as APBPrescaler, Sw as Sysclk};
 use crate::pac::{FLASH, RCC};
+use crate::rcc::LSI_FREQ;
 use crate::time::Hertz;
 
 /// HSI speed
@@ -67,9 +68,8 @@ pub struct Config {
     pub mux: super::mux::ClockMux,
 }
 
-impl Default for Config {
-    #[inline]
-    fn default() -> Config {
+impl Config {
+    pub const fn new() -> Self {
         Config {
             hse: None,
             hsi: false,
@@ -89,12 +89,18 @@ impl Default for Config {
             #[cfg(any(stm32l47x, stm32l48x, stm32l49x, stm32l4ax, rcc_l4plus, stm32l5))]
             pllsai2: None,
             #[cfg(crs)]
-            hsi48: Some(Default::default()),
-            ls: Default::default(),
+            hsi48: Some(crate::rcc::Hsi48Config::new()),
+            ls: crate::rcc::LsConfig::new(),
             #[cfg(any(stm32l0, stm32l1))]
             voltage_scale: VoltageScale::RANGE1,
-            mux: Default::default(),
+            mux: super::mux::ClockMux::default(),
         }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Config {
+        Self::new()
     }
 }
 
@@ -129,7 +135,14 @@ pub const WPAN_DEFAULT: Config = Config {
     apb1_pre: APBPrescaler::DIV1,
     apb2_pre: APBPrescaler::DIV1,
 
-    mux: super::mux::ClockMux::default(),
+    mux: {
+        use crate::pac::rcc::vals::Rfwkpsel;
+
+        let mut mux = super::mux::ClockMux::default();
+
+        mux.rfwkpsel = Rfwkpsel::LSE;
+        mux
+    },
 };
 
 fn msi_enable(range: MSIRange) {
@@ -181,6 +194,9 @@ pub(crate) unsafe fn init(config: Config) {
     });
 
     let rtc = config.ls.init();
+
+    let lse = config.ls.lse.map(|l| l.frequency);
+    let lsi = config.ls.lsi.then_some(LSI_FREQ);
 
     let msi = config.msi.map(|range| {
         msi_enable(range);
@@ -253,11 +269,29 @@ pub(crate) unsafe fn init(config: Config) {
         #[cfg(any(stm32l4, stm32l5, stm32wb, stm32wl, stm32u0))]
         msi,
     };
-    let pll = init_pll(PllInstance::Pll, config.pll, &pll_input);
+    let pll = config.pll.map_or_else(
+        || {
+            pll_enable(PllInstance::Pll, false);
+            PllOutput::default()
+        },
+        |c| init_pll(PllInstance::Pll, Some(c), &pll_input),
+    );
     #[cfg(any(stm32l4, stm32l5, stm32wb))]
-    let pllsai1 = init_pll(PllInstance::Pllsai1, config.pllsai1, &pll_input);
+    let pllsai1 = config.pllsai1.map_or_else(
+        || {
+            pll_enable(PllInstance::Pllsai1, false);
+            PllOutput::default()
+        },
+        |c| init_pll(PllInstance::Pllsai1, Some(c), &pll_input),
+    );
     #[cfg(any(stm32l47x, stm32l48x, stm32l49x, stm32l4ax, rcc_l4plus, stm32l5))]
-    let pllsai2 = init_pll(PllInstance::Pllsai2, config.pllsai2, &pll_input);
+    let pllsai2 = config.pllsai2.map_or_else(
+        || {
+            pll_enable(PllInstance::Pllsai2, false);
+            PllOutput::default()
+        },
+        |c| init_pll(PllInstance::Pllsai2, Some(c), &pll_input),
+    );
 
     let sys_clk = match config.sys {
         Sysclk::HSE => hse.unwrap(),
@@ -369,6 +403,17 @@ pub(crate) unsafe fn init(config: Config) {
         while !RCC.extcfgr().read().c2hpref() {}
     }
 
+    // Disable HSI if not used
+    if !config.hsi {
+        RCC.cr().modify(|w| w.set_hsion(false));
+    }
+
+    // Disable the HSI48, if not used
+    #[cfg(crs)]
+    if config.hsi48.is_none() {
+        super::disable_hsi48();
+    }
+
     config.mux.init();
 
     set_clocks!(
@@ -392,7 +437,7 @@ pub(crate) unsafe fn init(config: Config) {
         hsi48: hsi48,
 
         #[cfg(any(stm32l0, stm32l1))]
-        pll1_vco_div_2: pll.vco.map(|c| c/2u32),
+        pll1_vco: pll.vco,
 
         #[cfg(not(any(stm32l0, stm32l1)))]
         pll1_p: pll.p,
@@ -425,12 +470,12 @@ pub(crate) unsafe fn init(config: Config) {
         dsi_phy: None, // DSI PLL clock not supported, don't call `RccPeripheral::frequency()` in the drivers
 
         rtc: rtc,
+        lse: lse,
+        lsi: lsi,
 
         // TODO
         sai1_extclk: None,
         sai2_extclk: None,
-        lsi: None,
-        lse: None,
     );
 }
 
@@ -490,9 +535,9 @@ pub use pll::*;
 
 #[cfg(any(stm32l0, stm32l1))]
 mod pll {
-    use super::{pll_enable, PllInstance};
-    pub use crate::pac::rcc::vals::{Plldiv as PllDiv, Pllmul as PllMul, Pllsrc as PllSource};
+    use super::{PllInstance, pll_enable};
     use crate::pac::RCC;
+    pub use crate::pac::rcc::vals::{Plldiv as PllDiv, Pllmul as PllMul, Pllsrc as PllSource};
     use crate::time::Hertz;
 
     #[derive(Clone, Copy)]
@@ -554,11 +599,11 @@ mod pll {
 
 #[cfg(any(stm32l4, stm32l5, stm32wb, stm32wl, stm32u0))]
 mod pll {
-    use super::{pll_enable, PllInstance};
+    use super::{PllInstance, pll_enable};
+    use crate::pac::RCC;
     pub use crate::pac::rcc::vals::{
         Pllm as PllPreDiv, Plln as PllMul, Pllp as PllPDiv, Pllq as PllQDiv, Pllr as PllRDiv, Pllsrc as PllSource,
     };
-    use crate::pac::RCC;
     use crate::time::Hertz;
 
     #[derive(Clone, Copy)]

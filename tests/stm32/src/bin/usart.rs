@@ -6,10 +6,15 @@ mod common;
 use common::*;
 use defmt::{assert, assert_eq, unreachable};
 use embassy_executor::Spawner;
+use embassy_stm32::mode::Blocking;
 use embassy_stm32::usart::{Config, ConfigError, Error, Uart};
-use embassy_time::{block_for, Duration, Instant};
+use embassy_time::{Duration, Instant, block_for};
 
-#[embassy_executor::main]
+#[cfg_attr(
+    feature = "stop",
+    embassy_executor::main(executor = "embassy_stm32::executor::Executor", entry = "cortex_m_rt::entry")
+)]
+#[cfg_attr(not(feature = "stop"), embassy_executor::main)]
 async fn main(_spawner: Spawner) {
     let p = init();
     info!("Hello World!");
@@ -22,23 +27,49 @@ async fn main(_spawner: Spawner) {
 
     {
         let config = Config::default();
-        let mut usart = Uart::new_blocking(&mut usart, &mut rx, &mut tx, config).unwrap();
+        let mut usart = Uart::new_blocking(usart.reborrow(), rx.reborrow(), tx.reborrow(), config).unwrap();
 
-        // We can't send too many bytes, they have to fit in the FIFO.
-        // This is because we aren't sending+receiving at the same time.
+        let test_usart = async |usart: &mut Uart<'_, Blocking>| -> Result<(), Error> {
+            // We can't send too many bytes, they have to fit in the FIFO.
+            // This is because we aren't sending+receiving at the same time.
 
-        let data = [0xC0, 0xDE];
-        usart.blocking_write(&data).unwrap();
+            let data = [0xC0, 0xDE];
+            usart.blocking_write(&data)?;
 
-        let mut buf = [0; 2];
-        usart.blocking_read(&mut buf).unwrap();
-        assert_eq!(buf, data);
+            let mut buf = [0; 2];
+            usart.blocking_read(&mut buf)?;
+            assert_eq!(buf, data);
+
+            // Test flush doesn't hang.
+            usart.blocking_write(&data)?;
+            usart.blocking_flush()?;
+
+            // Test flush doesn't hang if there's nothing to flush
+            usart.blocking_flush()?;
+
+            Ok(())
+        };
+
+        let mut is_ok = false;
+        for _ in 0..3 {
+            match test_usart(&mut usart).await {
+                Ok(()) => is_ok = true,
+                Err(Error::Noise) => is_ok = false,
+                Err(e) => defmt::panic!("{}", e),
+            }
+
+            if is_ok {
+                break;
+            }
+        }
+
+        assert!(is_ok);
     }
 
     // Test error handling with with an overflow error
     {
         let config = Config::default();
-        let mut usart = Uart::new_blocking(&mut usart, &mut rx, &mut tx, config).unwrap();
+        let mut usart = Uart::new_blocking(usart.reborrow(), rx.reborrow(), tx.reborrow(), config).unwrap();
 
         // Send enough bytes to fill the RX FIFOs off all USART versions.
         let data = [0; 64];
@@ -68,7 +99,7 @@ async fn main(_spawner: Spawner) {
 
         let mut config = Config::default();
         config.baudrate = baudrate;
-        let mut usart = match Uart::new_blocking(&mut usart, &mut rx, &mut tx, config) {
+        let mut usart = match Uart::new_blocking(usart.reborrow(), rx.reborrow(), tx.reborrow(), config) {
             Ok(x) => x,
             Err(ConfigError::BaudrateTooHigh) => {
                 info!("baudrate too high");

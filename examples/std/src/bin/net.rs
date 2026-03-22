@@ -1,3 +1,5 @@
+use core::fmt::Write as _;
+
 use clap::Parser;
 use embassy_executor::{Executor, Spawner};
 use embassy_net::tcp::TcpSocket;
@@ -7,7 +9,7 @@ use embassy_time::Duration;
 use embedded_io_async::Write;
 use heapless::Vec;
 use log::*;
-use rand_core::{OsRng, RngCore};
+use rand_core::{OsRng, TryRngCore};
 use static_cell::StaticCell;
 
 #[derive(Parser)]
@@ -46,7 +48,7 @@ async fn main_task(spawner: Spawner) {
 
     // Generate random seed
     let mut seed = [0; 8];
-    OsRng.fill_bytes(&mut seed);
+    OsRng.try_fill_bytes(&mut seed).unwrap();
     let seed = u64::from_le_bytes(seed);
 
     // Init network stack
@@ -54,7 +56,7 @@ async fn main_task(spawner: Spawner) {
     let (stack, runner) = embassy_net::new(device, config, RESOURCES.init(StackResources::new()), seed);
 
     // Launch network task
-    spawner.spawn(net_task(runner)).unwrap();
+    spawner.spawn(net_task(runner).unwrap());
 
     // Then we can use it!
     let mut rx_buffer = [0; 4096];
@@ -71,8 +73,10 @@ async fn main_task(spawner: Spawner) {
         return;
     }
     info!("connected!");
-    loop {
-        let r = socket.write_all(b"Hello!\n").await;
+    for i in 0.. {
+        let mut buf = heapless::String::<100>::new();
+        write!(buf, "Hello! ({})\r\n", i).unwrap();
+        let r = socket.write_all(buf.as_bytes()).await;
         if let Err(e) = r {
             warn!("write error: {:?}", e);
             return;
@@ -91,6 +95,6 @@ fn main() {
 
     let executor = EXECUTOR.init(Executor::new());
     executor.run(|spawner| {
-        spawner.spawn(main_task(spawner)).unwrap();
+        spawner.spawn(main_task(spawner).unwrap());
     });
 }

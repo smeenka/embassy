@@ -2,10 +2,21 @@ use heapless::Vec;
 
 use crate::config::MAX_HANDLER_COUNT;
 use crate::descriptor::{BosWriter, DescriptorWriter, SynchronizationType, UsageType};
-use crate::driver::{Driver, Endpoint, EndpointInfo, EndpointType};
+use crate::driver::{Driver, Endpoint, EndpointAddress, EndpointInfo, EndpointType};
 use crate::msos::{DeviceLevelDescriptor, FunctionLevelDescriptor, MsOsDescriptorWriter};
 use crate::types::{InterfaceNumber, StringIndex};
-use crate::{Handler, Interface, UsbDevice, MAX_INTERFACE_COUNT, STRING_INDEX_CUSTOM_START};
+use crate::{Handler, Interface, MAX_INTERFACE_COUNT, STRING_INDEX_CUSTOM_START, UsbDevice};
+
+#[derive(Debug, Copy, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+/// Allows Configuring the Bcd USB version below 2.1
+pub enum UsbVersion {
+    /// Usb version 2.0
+    Two = 0x0200,
+    /// Usb version 2.1
+    TwoOne = 0x0210,
+}
 
 #[derive(Debug, Copy, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -15,20 +26,28 @@ pub struct Config<'a> {
     pub(crate) vendor_id: u16,
     pub(crate) product_id: u16,
 
+    /// Device BCD USB version.
+    ///
+    /// Default: `0x0210` ("2.1")
+    pub bcd_usb: UsbVersion,
+
     /// Device class code assigned by USB.org. Set to `0xff` for vendor-specific
     /// devices that do not conform to any class.
     ///
-    /// Default: `0x00` (class code specified by interfaces)
+    /// Default: `0xEF`
+    /// See also: `composite_with_iads`
     pub device_class: u8,
 
     /// Device sub-class code. Depends on class.
     ///
-    /// Default: `0x00`
+    /// Default: `0x02`
+    /// See also: `composite_with_iads`
     pub device_sub_class: u8,
 
     /// Device protocol code. Depends on class and sub-class.
     ///
-    /// Default: `0x00`
+    /// Default: `0x01`
+    /// See also: `composite_with_iads`
     pub device_protocol: u8,
 
     /// Device release version in BCD.
@@ -68,11 +87,14 @@ pub struct Config<'a> {
 
     /// Configures the device as a composite device with interface association descriptors.
     ///
-    /// If set to `true`, the following fields should have the given values:
+    /// If set to `true` (default), the following fields should have the given values:
     ///
     /// - `device_class` = `0xEF`
     /// - `device_sub_class` = `0x02`
     /// - `device_protocol` = `0x01`
+    ///
+    /// If set to `false`, those fields must be set correctly for the classes that will be
+    /// installed on the USB device.
     pub composite_with_iads: bool,
 
     /// Whether the device has its own power source.
@@ -101,19 +123,20 @@ impl<'a> Config<'a> {
     /// Create default configuration with the provided vid and pid values.
     pub const fn new(vid: u16, pid: u16) -> Self {
         Self {
-            device_class: 0x00,
-            device_sub_class: 0x00,
-            device_protocol: 0x00,
+            device_class: 0xEF,
+            device_sub_class: 0x02,
+            device_protocol: 0x01,
             max_packet_size_0: 64,
             vendor_id: vid,
             product_id: pid,
             device_release: 0x0010,
+            bcd_usb: UsbVersion::TwoOne,
             manufacturer: None,
             product: None,
             serial_number: None,
             self_powered: false,
             supports_remote_wakeup: false,
-            composite_with_iads: false,
+            composite_with_iads: true,
             max_power: 100,
         }
     }
@@ -153,7 +176,9 @@ impl<'d, D: Driver<'d>> Builder<'d, D> {
         if config.composite_with_iads
             && (config.device_class != 0xEF || config.device_sub_class != 0x02 || config.device_protocol != 0x01)
         {
-            panic!("if composite_with_iads is set, you must set device_class = 0xEF, device_sub_class = 0x02, device_protocol = 0x01");
+            panic!(
+                "if composite_with_iads is set, you must set device_class = 0xEF, device_sub_class = 0x02, device_protocol = 0x01"
+            );
         }
 
         assert!(
@@ -195,10 +220,10 @@ impl<'d, D: Driver<'d>> Builder<'d, D> {
         self.bos_descriptor.end_bos();
 
         // Log the number of allocator bytes actually used in descriptor buffers
-        info!("USB: config_descriptor used: {}", self.config_descriptor.position());
-        info!("USB: bos_descriptor used: {}", self.bos_descriptor.writer.position());
-        info!("USB: msos_descriptor used: {}", msos_descriptor.len());
-        info!("USB: control_buf size: {}", self.control_buf.len());
+        trace!("USB: config_descriptor used: {}", self.config_descriptor.position());
+        trace!("USB: bos_descriptor used: {}", self.bos_descriptor.writer.position());
+        trace!("USB: msos_descriptor used: {}", msos_descriptor.len());
+        trace!("USB: control_buf size: {}", self.control_buf.len());
 
         UsbDevice::build(
             self.driver,
@@ -314,7 +339,8 @@ impl<'a, 'd, D: Driver<'d>> FunctionBuilder<'a, 'd, D> {
             num_alt_settings: 0,
         };
 
-        assert!(self.builder.interfaces.push(iface).is_ok(),
+        assert!(
+            self.builder.interfaces.push(iface).is_ok(),
             "embassy-usb: interface list full. Increase the `max_interface_count` compile-time setting. Current value: {}",
             MAX_INTERFACE_COUNT
         );
@@ -442,11 +468,17 @@ impl<'a, 'd, D: Driver<'d>> InterfaceAltBuilder<'a, 'd, D> {
     /// Allocate an IN endpoint, without writing its descriptor.
     ///
     /// Used for granular control over the order of endpoint and descriptor creation.
-    pub fn alloc_endpoint_in(&mut self, ep_type: EndpointType, max_packet_size: u16, interval_ms: u8) -> D::EndpointIn {
+    pub fn alloc_endpoint_in(
+        &mut self,
+        ep_type: EndpointType,
+        ep_addr: Option<EndpointAddress>,
+        max_packet_size: u16,
+        interval_ms: u8,
+    ) -> D::EndpointIn {
         let ep = self
             .builder
             .driver
-            .alloc_endpoint_in(ep_type, max_packet_size, interval_ms)
+            .alloc_endpoint_in(ep_type, ep_addr, max_packet_size, interval_ms)
             .expect("alloc_endpoint_in failed");
 
         ep
@@ -455,13 +487,14 @@ impl<'a, 'd, D: Driver<'d>> InterfaceAltBuilder<'a, 'd, D> {
     fn endpoint_in(
         &mut self,
         ep_type: EndpointType,
+        ep_addr: Option<EndpointAddress>,
         max_packet_size: u16,
         interval_ms: u8,
         synchronization_type: SynchronizationType,
         usage_type: UsageType,
         extra_fields: &[u8],
     ) -> D::EndpointIn {
-        let ep = self.alloc_endpoint_in(ep_type, max_packet_size, interval_ms);
+        let ep = self.alloc_endpoint_in(ep_type, ep_addr, max_packet_size, interval_ms);
         self.endpoint_descriptor(ep.info(), synchronization_type, usage_type, extra_fields);
 
         ep
@@ -473,13 +506,14 @@ impl<'a, 'd, D: Driver<'d>> InterfaceAltBuilder<'a, 'd, D> {
     pub fn alloc_endpoint_out(
         &mut self,
         ep_type: EndpointType,
+        ep_addr: Option<EndpointAddress>,
         max_packet_size: u16,
         interval_ms: u8,
     ) -> D::EndpointOut {
         let ep = self
             .builder
             .driver
-            .alloc_endpoint_out(ep_type, max_packet_size, interval_ms)
+            .alloc_endpoint_out(ep_type, ep_addr, max_packet_size, interval_ms)
             .expect("alloc_endpoint_out failed");
 
         ep
@@ -488,13 +522,14 @@ impl<'a, 'd, D: Driver<'d>> InterfaceAltBuilder<'a, 'd, D> {
     fn endpoint_out(
         &mut self,
         ep_type: EndpointType,
+        ep_addr: Option<EndpointAddress>,
         max_packet_size: u16,
         interval_ms: u8,
         synchronization_type: SynchronizationType,
         usage_type: UsageType,
         extra_fields: &[u8],
     ) -> D::EndpointOut {
-        let ep = self.alloc_endpoint_out(ep_type, max_packet_size, interval_ms);
+        let ep = self.alloc_endpoint_out(ep_type, ep_addr, max_packet_size, interval_ms);
         self.endpoint_descriptor(ep.info(), synchronization_type, usage_type, extra_fields);
 
         ep
@@ -504,9 +539,10 @@ impl<'a, 'd, D: Driver<'d>> InterfaceAltBuilder<'a, 'd, D> {
     ///
     /// Descriptors are written in the order builder functions are called. Note that some
     /// classes care about the order.
-    pub fn endpoint_bulk_in(&mut self, max_packet_size: u16) -> D::EndpointIn {
+    pub fn endpoint_bulk_in(&mut self, ep_addr: Option<EndpointAddress>, max_packet_size: u16) -> D::EndpointIn {
         self.endpoint_in(
             EndpointType::Bulk,
+            ep_addr,
             max_packet_size,
             0,
             SynchronizationType::NoSynchronization,
@@ -519,9 +555,10 @@ impl<'a, 'd, D: Driver<'d>> InterfaceAltBuilder<'a, 'd, D> {
     ///
     /// Descriptors are written in the order builder functions are called. Note that some
     /// classes care about the order.
-    pub fn endpoint_bulk_out(&mut self, max_packet_size: u16) -> D::EndpointOut {
+    pub fn endpoint_bulk_out(&mut self, ep_addr: Option<EndpointAddress>, max_packet_size: u16) -> D::EndpointOut {
         self.endpoint_out(
             EndpointType::Bulk,
+            ep_addr,
             max_packet_size,
             0,
             SynchronizationType::NoSynchronization,
@@ -534,9 +571,15 @@ impl<'a, 'd, D: Driver<'d>> InterfaceAltBuilder<'a, 'd, D> {
     ///
     /// Descriptors are written in the order builder functions are called. Note that some
     /// classes care about the order.
-    pub fn endpoint_interrupt_in(&mut self, max_packet_size: u16, interval_ms: u8) -> D::EndpointIn {
+    pub fn endpoint_interrupt_in(
+        &mut self,
+        ep_addr: Option<EndpointAddress>,
+        max_packet_size: u16,
+        interval_ms: u8,
+    ) -> D::EndpointIn {
         self.endpoint_in(
             EndpointType::Interrupt,
+            ep_addr,
             max_packet_size,
             interval_ms,
             SynchronizationType::NoSynchronization,
@@ -546,9 +589,15 @@ impl<'a, 'd, D: Driver<'d>> InterfaceAltBuilder<'a, 'd, D> {
     }
 
     /// Allocate a INTERRUPT OUT endpoint and write its descriptor.
-    pub fn endpoint_interrupt_out(&mut self, max_packet_size: u16, interval_ms: u8) -> D::EndpointOut {
+    pub fn endpoint_interrupt_out(
+        &mut self,
+        ep_addr: Option<EndpointAddress>,
+        max_packet_size: u16,
+        interval_ms: u8,
+    ) -> D::EndpointOut {
         self.endpoint_out(
             EndpointType::Interrupt,
+            ep_addr,
             max_packet_size,
             interval_ms,
             SynchronizationType::NoSynchronization,
@@ -563,6 +612,7 @@ impl<'a, 'd, D: Driver<'d>> InterfaceAltBuilder<'a, 'd, D> {
     /// classes care about the order.
     pub fn endpoint_isochronous_in(
         &mut self,
+        ep_addr: Option<EndpointAddress>,
         max_packet_size: u16,
         interval_ms: u8,
         synchronization_type: SynchronizationType,
@@ -571,6 +621,7 @@ impl<'a, 'd, D: Driver<'d>> InterfaceAltBuilder<'a, 'd, D> {
     ) -> D::EndpointIn {
         self.endpoint_in(
             EndpointType::Isochronous,
+            ep_addr,
             max_packet_size,
             interval_ms,
             synchronization_type,
@@ -582,6 +633,7 @@ impl<'a, 'd, D: Driver<'d>> InterfaceAltBuilder<'a, 'd, D> {
     /// Allocate a ISOCHRONOUS OUT endpoint and write its descriptor.
     pub fn endpoint_isochronous_out(
         &mut self,
+        ep_addr: Option<EndpointAddress>,
         max_packet_size: u16,
         interval_ms: u8,
         synchronization_type: SynchronizationType,
@@ -590,6 +642,7 @@ impl<'a, 'd, D: Driver<'d>> InterfaceAltBuilder<'a, 'd, D> {
     ) -> D::EndpointOut {
         self.endpoint_out(
             EndpointType::Isochronous,
+            ep_addr,
             max_packet_size,
             interval_ms,
             synchronization_type,

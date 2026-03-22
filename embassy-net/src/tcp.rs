@@ -8,9 +8,9 @@
 //! Incoming connections when no socket is listening are rejected. To accept many incoming
 //! connections, create many sockets and put them all into listening mode.
 
-use core::future::poll_fn;
+use core::future::{Future, poll_fn};
 use core::mem;
-use core::task::Poll;
+use core::task::{Context, Poll};
 
 use embassy_time::Duration;
 use smoltcp::iface::{Interface, SocketHandle};
@@ -18,8 +18,8 @@ use smoltcp::socket::tcp;
 pub use smoltcp::socket::tcp::State;
 use smoltcp::wire::{IpEndpoint, IpListenEndpoint};
 
-use crate::time::duration_to_smoltcp;
 use crate::Stack;
+use crate::time::duration_to_smoltcp;
 
 /// Error returned by TcpSocket read/write functions.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -73,6 +73,16 @@ pub struct TcpWriter<'a> {
 }
 
 impl<'a> TcpReader<'a> {
+    /// Wait until the socket becomes readable.
+    ///
+    /// A socket becomes readable when the receive half of the full-duplex connection is open
+    /// (see [`may_recv()`](TcpSocket::may_recv)), and there is some pending data in the receive buffer.
+    ///
+    /// This is the equivalent of [read](#method.read), without buffering any data.
+    pub fn wait_read_ready(&self) -> impl Future<Output = ()> + '_ {
+        poll_fn(move |cx| self.io.poll_read_ready(cx))
+    }
+
     /// Read data from the socket.
     ///
     /// Returns how many bytes were read, or an error. If no data is available, it waits
@@ -115,20 +125,30 @@ impl<'a> TcpReader<'a> {
 }
 
 impl<'a> TcpWriter<'a> {
+    /// Wait until the socket becomes writable.
+    ///
+    /// A socket becomes writable when the transmit half of the full-duplex connection is open
+    /// (see [`may_send()`](TcpSocket::may_send)), and the transmit buffer is not full.
+    ///
+    /// This is the equivalent of [write](#method.write), without sending any data.
+    pub fn wait_write_ready(&self) -> impl Future<Output = ()> + '_ {
+        poll_fn(move |cx| self.io.poll_write_ready(cx))
+    }
+
     /// Write data to the socket.
     ///
     /// Returns how many bytes were written, or an error. If the socket is not ready to
     /// accept data, it waits until it is.
-    pub async fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
-        self.io.write(buf).await
+    pub fn write<'s>(&'s mut self, buf: &'s [u8]) -> impl Future<Output = Result<usize, Error>> + 's {
+        self.io.write(buf)
     }
 
     /// Flushes the written data to the socket.
     ///
     /// This waits until all data has been sent, and ACKed by the remote host. For a connection
     /// closed with [`abort()`](TcpSocket::abort) it will wait for the TCP RST packet to be sent.
-    pub async fn flush(&mut self) -> Result<(), Error> {
-        self.io.flush().await
+    pub fn flush(&mut self) -> impl Future<Output = Result<(), Error>> + '_ {
+        self.io.flush()
     }
 
     /// Call `f` with the largest contiguous slice of octets in the transmit buffer,
@@ -166,7 +186,7 @@ impl<'a> TcpSocket<'a> {
         });
 
         Self {
-            io: TcpIo { stack: stack, handle },
+            io: TcpIo { stack, handle },
         }
     }
 
@@ -274,6 +294,16 @@ impl<'a> TcpSocket<'a> {
         .await
     }
 
+    /// Wait until the socket becomes readable.
+    ///
+    /// A socket becomes readable when the receive half of the full-duplex connection is open
+    /// (see [may_recv](#method.may_recv)), and there is some pending data in the receive buffer.
+    ///
+    /// This is the equivalent of [read](#method.read), without buffering any data.
+    pub fn wait_read_ready(&self) -> impl Future<Output = ()> + '_ {
+        poll_fn(move |cx| self.io.poll_read_ready(cx))
+    }
+
     /// Read data from the socket.
     ///
     /// Returns how many bytes were read, or an error. If no data is available, it waits
@@ -281,24 +311,34 @@ impl<'a> TcpSocket<'a> {
     ///
     /// A return value of Ok(0) means that the socket was closed and is longer
     /// able to receive any data.
-    pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-        self.io.read(buf).await
+    pub fn read<'s>(&'s mut self, buf: &'s mut [u8]) -> impl Future<Output = Result<usize, Error>> + 's {
+        self.io.read(buf)
+    }
+
+    /// Wait until the socket becomes writable.
+    ///
+    /// A socket becomes writable when the transmit half of the full-duplex connection is open
+    /// (see [may_send](#method.may_send)), and the transmit buffer is not full.
+    ///
+    /// This is the equivalent of [write](#method.write), without sending any data.
+    pub fn wait_write_ready(&self) -> impl Future<Output = ()> + '_ {
+        poll_fn(move |cx| self.io.poll_write_ready(cx))
     }
 
     /// Write data to the socket.
     ///
     /// Returns how many bytes were written, or an error. If the socket is not ready to
     /// accept data, it waits until it is.
-    pub async fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
-        self.io.write(buf).await
+    pub fn write<'s>(&'s mut self, buf: &'s [u8]) -> impl Future<Output = Result<usize, Error>> + 's {
+        self.io.write(buf)
     }
 
     /// Flushes the written data to the socket.
     ///
     /// This waits until all data has been sent, and ACKed by the remote host. For a connection
     /// closed with [`abort()`](TcpSocket::abort) it will wait for the TCP RST packet to be sent.
-    pub async fn flush(&mut self) -> Result<(), Error> {
-        self.io.flush().await
+    pub fn flush(&mut self) -> impl Future<Output = Result<(), Error>> + '_ {
+        self.io.flush()
     }
 
     /// Set the timeout for the socket.
@@ -331,6 +371,20 @@ impl<'a> TcpSocket<'a> {
     /// Set the hop limit field in the IP header of sent packets.
     pub fn set_hop_limit(&mut self, hop_limit: Option<u8>) {
         self.io.with_mut(|s, _| s.set_hop_limit(hop_limit))
+    }
+
+    /// Enable or disable Nagles's algorithm.
+    ///
+    /// By default, Nagle's algorithm is enabled.
+    /// When enabled, Nagle’s Algorithm prevents sending segments smaller
+    /// than MSS if there is data in flight (sent but not acknowledged).
+    /// In other words, it ensures at most only one segment smaller than
+    /// MSS is in flight at a time.
+    /// It ensures better network utilization by preventing sending many
+    /// very small packets, at the cost of increased latency in some
+    /// situations, particularly when the remote peer has ACK delay enabled.
+    pub fn set_nagle_enabled(&mut self, enabled: bool) {
+        self.io.with_mut(|s, _| s.set_nagle_enabled(enabled))
     }
 
     /// Get the local endpoint of the socket.
@@ -376,9 +430,23 @@ impl<'a> TcpSocket<'a> {
         self.io.with_mut(|s, _| s.abort())
     }
 
-    /// Get whether the socket is ready to send data, i.e. whether there is space in the send buffer.
+    /// Return whether the transmit half of the full-duplex connection is open.
+    ///
+    /// This function returns true if it's possible to send data and have it arrive
+    /// to the remote endpoint. However, it does not make any guarantees about the state
+    /// of the transmit buffer, and even if it returns true, [write](#method.write) may
+    /// not be able to enqueue any octets.
+    ///
+    /// In terms of the TCP state machine, the socket must be in the `ESTABLISHED` or
+    /// `CLOSE-WAIT` state.
     pub fn may_send(&self) -> bool {
         self.io.with(|s, _| s.may_send())
+    }
+
+    /// Check whether the transmit half of the full-duplex connection is open
+    /// (see [may_send](#method.may_send)), and the transmit buffer is not full.
+    pub fn can_send(&self) -> bool {
+        self.io.with(|s, _| s.can_send())
     }
 
     /// return whether the receive half of the full-duplex connection is open.
@@ -427,7 +495,7 @@ impl<'d> TcpIo<'d> {
         })
     }
 
-    fn with_mut<R>(&mut self, f: impl FnOnce(&mut tcp::Socket, &mut Interface) -> R) -> R {
+    fn with_mut<R>(&self, f: impl FnOnce(&mut tcp::Socket, &mut Interface) -> R) -> R {
         self.stack.with_mut(|i| {
             let socket = i.sockets.get_mut::<tcp::Socket>(self.handle);
             let res = f(socket, &mut i.iface);
@@ -436,8 +504,19 @@ impl<'d> TcpIo<'d> {
         })
     }
 
-    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-        poll_fn(move |cx| {
+    fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.with_mut(|s, _| {
+            if s.can_recv() {
+                Poll::Ready(())
+            } else {
+                s.register_recv_waker(cx.waker());
+                Poll::Pending
+            }
+        })
+    }
+
+    fn read<'s>(&'s mut self, buf: &'s mut [u8]) -> impl Future<Output = Result<usize, Error>> + 's {
+        poll_fn(|cx| {
             // CAUTION: smoltcp semantics around EOF are different to what you'd expect
             // from posix-like IO, so we have to tweak things here.
             self.with_mut(|s, _| match s.recv_slice(buf) {
@@ -461,11 +540,21 @@ impl<'d> TcpIo<'d> {
                 Err(tcp::RecvError::InvalidState) => Poll::Ready(Err(Error::ConnectionReset)),
             })
         })
-        .await
     }
 
-    async fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
-        poll_fn(move |cx| {
+    fn poll_write_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.with_mut(|s, _| {
+            if s.can_send() {
+                Poll::Ready(())
+            } else {
+                s.register_send_waker(cx.waker());
+                Poll::Pending
+            }
+        })
+    }
+
+    fn write<'s>(&'s mut self, buf: &'s [u8]) -> impl Future<Output = Result<usize, Error>> + 's {
+        poll_fn(|cx| {
             self.with_mut(|s, _| match s.send_slice(buf) {
                 // Not ready to send (no space in the tx buffer)
                 Ok(0) => {
@@ -478,7 +567,6 @@ impl<'d> TcpIo<'d> {
                 Err(tcp::SendError::InvalidState) => Poll::Ready(Err(Error::ConnectionReset)),
             })
         })
-        .await
     }
 
     async fn write_with<F, R>(&mut self, f: F) -> Result<R, Error>
@@ -539,8 +627,8 @@ impl<'d> TcpIo<'d> {
         .await
     }
 
-    async fn flush(&mut self) -> Result<(), Error> {
-        poll_fn(move |cx| {
+    fn flush(&mut self) -> impl Future<Output = Result<(), Error>> + '_ {
+        poll_fn(|cx| {
             self.with_mut(|s, _| {
                 let data_pending = (s.send_queue() > 0) && s.state() != tcp::State::Closed;
                 let fin_pending = matches!(
@@ -560,7 +648,6 @@ impl<'d> TcpIo<'d> {
                 }
             })
         })
-        .await
     }
 
     fn recv_capacity(&self) -> usize {
@@ -583,6 +670,13 @@ impl<'d> TcpIo<'d> {
 mod embedded_io_impls {
     use super::*;
 
+    impl core::fmt::Display for ConnectError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("ConnectError")
+        }
+    }
+    impl core::error::Error for ConnectError {}
+
     impl embedded_io_async::Error for ConnectError {
         fn kind(&self) -> embedded_io_async::ErrorKind {
             match self {
@@ -593,6 +687,15 @@ mod embedded_io_impls {
             }
         }
     }
+
+    impl core::fmt::Display for Error {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self {
+                Self::ConnectionReset => f.write_str("ConnectionReset"),
+            }
+        }
+    }
+    impl core::error::Error for Error {}
 
     impl embedded_io_async::Error for Error {
         fn kind(&self) -> embedded_io_async::ErrorKind {
@@ -730,7 +833,7 @@ pub mod client {
             };
             let remote_endpoint = (addr, remote.port());
             let mut socket = TcpConnection::new(self.stack, self.state)?;
-            socket.socket.set_timeout(self.socket_timeout.clone());
+            socket.socket.set_timeout(self.socket_timeout);
             socket
                 .socket
                 .connect(remote_endpoint)
