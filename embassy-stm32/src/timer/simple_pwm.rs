@@ -350,6 +350,10 @@ impl<'d, T: GeneralInstance4Channel> SimplePwm<'d, T> {
             ch4: ch(Channel::Ch4, self.ch4),
         }
     }
+    /// ensable or disable the update interrupt
+    pub fn enable_update_interrupt(&mut self, enable: bool) {
+        self.inner.enable_update_interrupt(enable);
+    }
 
     /// Set PWM frequency.
     ///
@@ -445,6 +449,10 @@ impl<'d, T: GeneralInstance4Channel> SimplePwm<'d, T> {
     /// This value depends on the configured frequency and the timer's clock rate from RCC.
     pub fn max_duty_cycle(&self) -> u32 {
         self.inner.get_max_compare_value().into() + 1
+    }
+    /// Reset the counter value to 0
+    pub fn reset(&self) {
+        self.inner.reset();
     }
 
     /// Generate a sequence of PWM waveform
