@@ -2,6 +2,8 @@
 
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
+use core::pin::Pin;
+use core::task::{Context, Poll};
 
 use super::low_level::{CountingMode, OutputCompareMode, OutputPolarity, RoundTo, Timer};
 use super::ringbuffered::RingBufferedPwmChannel;
@@ -350,9 +352,20 @@ impl<'d, T: GeneralInstance4Channel> SimplePwm<'d, T> {
             ch4: ch(Channel::Ch4, self.ch4),
         }
     }
+
     /// ensable or disable the update interrupt
     pub fn enable_update_interrupt(&mut self, enable: bool) {
         self.inner.enable_update_interrupt(enable);
+    }    
+
+    /// retreive the update future
+    fn new_update_future(&self) -> UpdateFuture<T> {
+        self.inner.enable_update_interrupt(true);
+        UpdateFuture { phantom: PhantomData }
+    }
+    /// Asynchronously wait until update interrupt
+    pub async fn wait_for_update(&mut self) {
+        self.new_update_future().await
     }
 
     /// Set PWM frequency.
@@ -618,5 +631,42 @@ impl<'d, T: GeneralInstance4Channel> embedded_hal_02::Pwm for SimplePwm<'d, T> {
         P: Into<Self::Time>,
     {
         self.inner.set_frequency(period.into(), RoundTo::Slower);
+    }
+}
+
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct UpdateFuture<T: GeneralInstance4Channel> {
+    phantom: PhantomData<T>,
+}
+
+impl<T: GeneralInstance4Channel> Drop for UpdateFuture<T> {
+    fn drop(&mut self) {
+        critical_section::with(|_| {
+            let regs = unsafe { crate::pac::timer::TimGp16::from_ptr(T::regs()) };
+            // disable interrupt enable for update interrupt
+            regs.dier().modify(|w| w.set_uie(false));
+        });
+    }
+}
+
+impl<T: GeneralInstance4Channel> Future for UpdateFuture<T> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        T::state().up_waker.register(cx.waker());
+
+        let regs = unsafe { crate::pac::timer::TimGp16::from_ptr(T::regs()) };
+
+        // Read TIM interrupt flags.
+        let sr = regs.sr().read();
+
+        // check if update interupt status flag is set (is not reset in interrupt)
+        if sr.uif() {
+            // reset interupt flag to prevent interrupt generation here
+            regs.sr().modify(|w| w.set_uif(false));
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
     }
 }
