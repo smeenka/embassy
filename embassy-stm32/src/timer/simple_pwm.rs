@@ -356,7 +356,7 @@ impl<'d, T: GeneralInstance4Channel> SimplePwm<'d, T> {
     /// ensable or disable the update interrupt
     pub fn enable_update_interrupt(&mut self, enable: bool) {
         self.inner.enable_update_interrupt(enable);
-    }    
+    }
 
     /// retreive the update future
     fn new_update_future(&self) -> UpdateFuture<T> {
@@ -635,7 +635,10 @@ impl<'d, T: GeneralInstance4Channel> embedded_hal_02::Pwm for SimplePwm<'d, T> {
 }
 
 #[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct UpdateFuture<T: GeneralInstance4Channel> {
+/// UpdateFuture
+///
+/// For waiting on the update interrupt, at the start of each timer cyclus
+struct UpdateFuture<T: GeneralInstance4Channel> {
     phantom: PhantomData<T>,
 }
 
