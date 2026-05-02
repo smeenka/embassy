@@ -13,6 +13,7 @@ use crate::dma::word::Word;
 #[cfg(gpio_v2)]
 use crate::gpio::Pull;
 use crate::gpio::{AfType, Flex, OutputType, Speed};
+use crate::pac::timer::regs::CcerGp16;
 use crate::pac::timer::vals::Ccds;
 use crate::time::Hertz;
 
@@ -359,7 +360,7 @@ impl<'d, T: GeneralInstance4Channel> SimplePwm<'d, T> {
     }
 
     /// retreive the update future
-    fn new_update_future(&self) -> UpdateFuture<T> {
+    pub fn new_update_future(&self) -> UpdateFuture<T> {
         self.inner.enable_update_interrupt(true);
         UpdateFuture { phantom: PhantomData }
     }
@@ -466,6 +467,15 @@ impl<'d, T: GeneralInstance4Channel> SimplePwm<'d, T> {
     /// Reset the counter value to 0
     pub fn reset(&self) {
         self.inner.reset();
+    }
+
+    /// Set output polarity.
+    pub fn set_output_polarity(&self, channel: Channel, polarity: OutputPolarity) {
+        self.inner.set_output_polarity(channel, polarity);
+    }
+    /// Write an u16 bit pattern into the ccer register
+    pub fn write_ccer_reg(&self, ccer_value: u32) {
+        self.inner.write_ccer_reg(ccer_value);
     }
 
     /// Generate a sequence of PWM waveform
@@ -638,7 +648,7 @@ impl<'d, T: GeneralInstance4Channel> embedded_hal_02::Pwm for SimplePwm<'d, T> {
 /// UpdateFuture
 ///
 /// For waiting on the update interrupt, at the start of each timer cyclus
-struct UpdateFuture<T: GeneralInstance4Channel> {
+pub struct UpdateFuture<T: GeneralInstance4Channel> {
     phantom: PhantomData<T>,
 }
 

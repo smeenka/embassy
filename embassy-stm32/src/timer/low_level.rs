@@ -16,6 +16,7 @@ pub use stm32_metapac::timer::vals::{FilterValue, Mms as MasterMode, Sms as Slav
 
 use super::*;
 use crate::dma::{self, Transfer, WritableRingBuffer};
+use crate::pac::timer::regs::CcerGp16;
 use crate::pac::timer::vals;
 use crate::rcc;
 use crate::time::Hertz;
@@ -787,6 +788,11 @@ impl<'d, T: GeneralInstance4Channel> Timer<'d, T> {
         self.regs_gp16()
             .ccer()
             .modify(|w| w.set_ccp(channel.index(), polarity.into()));
+    }
+    /// Write an u16 bit pattern into the ccer register
+    pub fn write_ccer_reg(&self, ccer_value: u32) {
+        let p = CcerGp16 { 0: ccer_value };
+        self.regs_gp16().ccer().write_value(p);
     }
 
     /// Enable/disable a channel.
