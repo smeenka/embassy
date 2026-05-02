@@ -1572,15 +1572,16 @@ impl<'d, M: Mode> I2c<'d, M, MultiMaster> {
     }
 
     fn configure_oa1(&mut self, oa1: Address) {
+        self.info.regs.oar1().write(|reg| {
+            reg.set_oa1en(false);
+        });
         match oa1 {
             Address::SevenBit(addr) => self.info.regs.oar1().write(|reg| {
-                reg.set_oa1en(false);
                 reg.set_oa1((addr << 1) as u16);
                 reg.set_oa1mode(Addmode::BIT7);
                 reg.set_oa1en(true);
             }),
             Address::TenBit(addr) => self.info.regs.oar1().write(|reg| {
-                reg.set_oa1en(false);
                 reg.set_oa1(addr);
                 reg.set_oa1mode(Addmode::BIT10);
                 reg.set_oa1en(true);
@@ -1591,8 +1592,12 @@ impl<'d, M: Mode> I2c<'d, M, MultiMaster> {
     fn configure_oa2(&mut self, oa2: OA2) {
         self.info.regs.oar2().write(|reg| {
             reg.set_oa2en(false);
+        });
+        self.info.regs.oar2().write(|reg| {
             reg.set_oa2msk(oa2.mask.into());
-            reg.set_oa2(oa2.addr << 1);
+            // todo: create change request for next line
+            //reg.set_oa2(oa2.addr << 1); original
+            reg.set_oa2(oa2.addr); // corrected
             reg.set_oa2en(true);
         });
     }
